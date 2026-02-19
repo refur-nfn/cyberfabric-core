@@ -365,6 +365,10 @@ pub struct ClientConfig {
     pub max_backoff: Duration,
     /// Availability policy.
     pub availability_policy: ClientAvailabilityPolicy,
+    /// Circuit breaker configuration.
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// Optional fallback behavior when circuit is open.
+    pub fallback: FallbackStrategy,
 }
 
 impl Default for ClientConfig {
@@ -684,7 +688,6 @@ impl LazyCalculatorClient {
         self.execute_with_retry(|| async {
             self.provider.http_client()
                 .post(&url)
-                .header("x-tenant-id", ctx.tenant_id_str())
                 .header("Idempotency-Key", &idempotency_key)  // Same key for all retries
                 .json(&input)
                 .send()
@@ -722,17 +725,14 @@ async fn idempotency_middleware(
         return next.run(request).await;
     };
     
-    let tenant_id = headers.get("x-tenant-id").map(|v| v.to_str().unwrap_or(""));
-    let cache_key = format!("{}:{}", tenant_id.unwrap_or(""), key.to_str().unwrap_or(""));
-    
     // Check for cached response
-    if let Some(cached) = cache.get(&cache_key).await {
+    if let Some(cached) = cache.get(&key).await {
         return cached;
     }
     
     // Process request and cache response
     let response = next.run(request).await;
-    cache.set(&cache_key, &response, Duration::from_secs(86400)).await;
+    cache.set(&key, &response, Duration::from_secs(86400)).await;
     response
 }
 ```
@@ -1281,6 +1281,142 @@ impl LazyClientError {
 
 ---
 
+#### 3.7 Initialization Order and Circular Dependencies
+
+##### DirectoryClient Bootstrap Guarantee
+
+The `DirectoryClient` is **always available** before any lazy client attempts resolution. This is guaranteed by the bootstrap sequence:
+
+**OoP Module Bootstrap** (`libs/modkit/src/bootstrap/oop.rs`):
+```rust
+// 1. Connect to directory service FIRST (before module init)
+let directory_client = DirectoryGrpcClient::connect(&opts.directory_endpoint).await?;
+let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
+
+// 2. Inject DirectoryClient into ClientHub via RunOptions
+let run_options = RunOptions {
+    clients: vec![ClientRegistration::new::<dyn DirectoryClient>(directory_api)],
+    // ...
+};
+
+// 3. Only then run module lifecycle (init → start → ready)
+run(run_options).await
+```
+
+**Host Runtime Bootstrap** (`libs/modkit/src/bootstrap/run.rs`):
+```rust
+// For in-process host, DirectoryClient is the LocalDirectoryClient
+// which is created during HostRuntime construction, before any module init
+```
+
+**Initialization Order:**
+```
+1. Bootstrap connects to DirectoryService (OoP) or creates LocalDirectoryClient (host)
+2. DirectoryClient registered in ClientHub
+3. Module registry discovered
+4. HostRuntime created with ClientHub containing DirectoryClient
+5. Modules initialized (init phase) — lazy clients created but NOT resolved
+6. Modules started (start phase)
+7. First API call triggers lazy resolution — DirectoryClient guaranteed present
+```
+
+##### Why Lazy Clients Never Fail on Missing DirectoryClient
+
+Lazy clients don't resolve during `init()` or `start()`. Resolution happens on **first use**:
+
+```rust
+impl LazyCalculatorClient {
+    async fn add(&self, ctx: &SecurityContext, a: i64, b: i64) -> Result<i64, CalculatorError> {
+        // Resolution happens HERE, not during construction
+        let base_url = self.provider.get_base_url().await?;
+        // ...
+    }
+}
+```
+
+By the time any API call is made, the module is already in `Running` state, which means:
+- Bootstrap completed successfully
+- `DirectoryClient` is in `ClientHub`
+- HTTP server is accepting requests
+
+##### Circular Module Dependencies
+
+**Scenario:** Module A depends on Module B, and Module B depends on Module A.
+
+```
+┌──────────┐         ┌──────────┐
+│ Module A │ ──────▶ │ Module B │
+│          │ ◀────── │          │
+└──────────┘         └──────────┘
+```
+
+**With lazy clients, this works:**
+
+1. Both modules start independently (no blocking on dependency availability)
+2. Module A's first call to B triggers lazy resolution
+3. Module B's first call to A triggers lazy resolution
+4. As long as both are registered in the directory, calls succeed
+
+**Failure modes:**
+- If A calls B before B is registered → backoff + retry (eventually succeeds)
+- If A calls B and B is permanently down → circuit breaker opens, HTTP 424
+
+##### Multi-Exec / Parallel Startup
+
+In multi-exec scenarios (multiple processes starting simultaneously):
+
+```
+Process 1 (Host)          Process 2 (OoP Module)
+─────────────────         ─────────────────────
+1. Start                  1. Start
+2. Create LocalDirectory  2. Connect to DirectoryService
+3. Start gRPC hub         3. Wait for gRPC hub endpoint
+4. Spawn OoP modules      4. Register with directory
+5. Modules init           5. Module init
+6. Modules start          6. Module start
+```
+
+**Key guarantee:** OoP modules wait for the host's gRPC hub to be ready before connecting:
+
+```rust
+// OoP bootstrap waits for directory endpoint
+let directory_endpoint = std::env::var(MODKIT_DIRECTORY_ENDPOINT_ENV)?;
+let directory_client = DirectoryGrpcClient::connect(&directory_endpoint).await?;
+```
+
+The `MODKIT_DIRECTORY_ENDPOINT_ENV` is only set by the host **after** the gRPC hub is bound and ready.
+
+##### Race Condition Mitigations
+
+| Race Condition | Mitigation |
+|----------------|------------|
+| Lazy client resolves before target module registered | Backoff + retry; circuit breaker if persistent |
+| DirectoryClient not in ClientHub | Impossible — bootstrap registers it before module init |
+| Multiple processes racing to register | Directory handles concurrent registrations; round-robin picks any healthy instance |
+| Module A calls B while B is still in `init()` | B not yet registered; A's call backs off until B reaches `start()` and registers |
+
+##### Required vs Optional Dependencies
+
+For **critical** circular dependencies where both must be available at startup:
+
+```rust
+impl ClientDescriptor for CalculatorClientDescriptor {
+    fn config() -> ClientConfig {
+        ClientConfig {
+            availability_policy: ClientAvailabilityPolicy::Required,
+            ..ClientConfig::rest()
+        }
+    }
+}
+```
+
+With `Required` policy:
+- Module's readiness probe fails until dependency is resolvable
+- Kubernetes/orchestrator won't route traffic until both are ready
+- Prevents serving requests that would immediately fail
+
+---
+
 ### Phase 4: SDK Crate Updates (calculator-sdk example)
 
 #### 4.1 Descriptor
@@ -1354,7 +1490,6 @@ impl CalculatorClientV1 for LazyCalculatorClient {
         let url = format!("{}/api/v1/calculator/add", base_url);
         let response = self.provider.http_client()
             .post(&url)
-            .header("x-tenant-id", ctx.tenant_id().map(|t| t.to_string()).unwrap_or_default())
             .json(&serde_json::json!({ "a": a, "b": b }))
             .send()
             .await
@@ -1385,9 +1520,6 @@ impl CalculatorClientV1 for LazyCalculatorClient {
 #[derive(serde::Deserialize)]
 struct AddResponse { result: i64 }
 
-/// Maps HTTP status codes to SDK errors.
-#[derive(serde::Deserialize)]
-struct AddResponse { result: i64 }
 /// Maps HTTP status codes to SDK errors.
 /// Note: Signature should use http::StatusCode to match modkit_http::HttpClient shown above.
 fn map_http_error(status: http::StatusCode, body: &str) -> CalculatorError {
