@@ -1491,13 +1491,17 @@ name = "cf-oagw-sdk"
 version = "0.2.12"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "cf-modkit-security",
  "futures-core",
  "futures-util",
  "http",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

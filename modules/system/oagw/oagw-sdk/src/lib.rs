@@ -1,6 +1,9 @@
 pub mod api;
 pub mod body;
+pub mod codec;
 pub mod error;
+pub mod sse;
+pub mod ws;
 
 pub mod models;
 
@@ -16,4 +19,13 @@ pub use models::{
 
 pub use api::ServiceGatewayClientV1;
 pub use body::Body;
+pub use codec::Json;
+pub use error::StreamingError;
 pub use modkit_security::SecurityContext;
+pub use sse::{FromServerEvent, ServerEvent, ServerEventsResponse, ServerEventsStream};
+#[cfg(feature = "axum")]
+pub use ws::axum_adapter;
+pub use ws::{
+    FromWebSocketMessage, WebSocketCloseFrame, WebSocketMessage, WebSocketReceiver,
+    WebSocketSender, WebSocketSink, WebSocketStream, WebSocketStreamReceiver,
+};
