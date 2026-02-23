@@ -165,7 +165,7 @@ Quota-driven automatic downgrade within the two-tier cascade IS permitted mid-co
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-fr-chat-streaming`
 
-The system MUST deliver AI responses as a real-time SSE stream. The user sends a message and immediately begins receiving `delta` events as they are generated. The stream terminates with exactly one terminal `done` or `error` event. The terminal `done` event contains the message ID and token usage. The terminal `error` event contains an error `code` and `message` only.
+The system MUST deliver AI responses as a real-time SSE stream. The user sends a message and immediately begins receiving `delta` events as they are generated. The stream terminates with exactly one terminal `done` or `error` event. The terminal `done` event contains the message ID and token usage. The terminal `error` event uses the same error envelope as JSON error responses: `code` and `message`, plus `quota_scope` when `code = "quota_exceeded"`.
 
 **Error model (Option A)**: If request validation, authorization, or quota preflight fails before any streaming begins, the system MUST return a normal JSON error response with the appropriate HTTP status and MUST NOT open an SSE stream. If a failure occurs after streaming has started, the system MUST terminate the stream with a terminal `event: error`.
 

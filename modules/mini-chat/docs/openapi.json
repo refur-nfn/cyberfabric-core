@@ -1341,19 +1341,11 @@
         }
       },
       "SseErrorEvent": {
-        "type": "object",
-        "required": ["code", "message"],
-        "description": "SSE `event: error` payload. Terminal event indicating a failure after the stream has started. Uses the same schema as ErrorResponse.",
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Canonical error code (see ErrorResponse.code enum)."
-          },
-          "message": {
-            "type": "string",
-            "description": "Human-readable error description."
-          }
-        }
+        "description": "SSE `event: error` payload. Terminal event indicating a failure after the stream has started. Shares the same error envelope as JSON error responses: GenericError for all non-quota errors, QuotaExceededError (with required quota_scope) when code is quota_exceeded.",
+        "oneOf": [
+          { "$ref": "#/components/schemas/QuotaExceededError" },
+          { "$ref": "#/components/schemas/GenericError" }
+        ]
       },
       "WebSearchOption": {
         "type": "object",

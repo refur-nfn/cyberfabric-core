@@ -586,7 +586,7 @@ Finalizes the stream. Provides usage and model selection metadata.
 
 ##### `event: error`
 
-Terminates the stream with an application error. No further events follow.
+Terminates the stream with an application error. No further events follow. The SSE error payload uses the **same envelope** as JSON error responses (see Error Codes table below): `code` + `message`, with `quota_scope` required when `code = "quota_exceeded"`.
 
 ```
 event: error
@@ -597,6 +597,7 @@ data: {"code": "quota_exceeded", "message": "Daily limit reached", "quota_scope"
 |-------|------|-------------|
 | `code` | string | Canonical error code (see table below). |
 | `message` | string | Human-readable description. |
+| `quota_scope` | `"tokens"` \| `"uploads"` | **Required** when `code = "quota_exceeded"`; MUST be absent otherwise. Clients MUST use this field, not `message` parsing, to determine quota scope. |
 
 ##### `event: ping`
 
