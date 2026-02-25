@@ -13,6 +13,123 @@ release-plz updates this file in the Release PR.
 
 ### Other
 
+- release (by @github-actions[bot]) - #749
+- migrate modules from ArcSwapOption to OnceLock (by @aviator5) - #660
+
+### Contributors
+
+* @github-actions[bot]
+* @aviator5
+
+## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authz-plugin-v0.1.0...cf-static-authz-plugin-v0.1.1) - 2026-02-25
+
+### Other
+
+- release (by @github-actions[bot]) - #749
+- Merge pull request #660 from aviator5/module-oncelock-refactoring (by @MikeFalcon77) - #660
+- migrate modules from ArcSwapOption to OnceLock (by @aviator5) - #660
+
+### Contributors
+
+* @github-actions[bot]
+* @MikeFalcon77
+* @aviator5
+
+## [0.1.1](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-authn-plugin-v0.1.0...cf-static-authn-plugin-v0.1.1) - 2026-02-25
+
+### Other
+
+- release (by @github-actions[bot]) - #749
+- Merge pull request #660 from aviator5/module-oncelock-refactoring (by @MikeFalcon77) - #660
+- migrate modules from ArcSwapOption to OnceLock (by @aviator5) - #660
+
+### Contributors
+
+* @github-actions[bot]
+* @MikeFalcon77
+* @aviator5
+
+## [0.1.3](https://github.com/cyberfabric/cyberfabric-core/compare/cf-single-tenant-tr-plugin-v0.1.2...cf-single-tenant-tr-plugin-v0.1.3) - 2026-02-25
+
+### Other
+
+- release (by @github-actions[bot]) - #749
+- migrate modules from ArcSwapOption to OnceLock (by @aviator5) - #660
+
+### Contributors
+
+* @github-actions[bot]
+* @aviator5
+
+## [0.1.0](https://github.com/cyberfabric/cyberfabric-core/releases/tag/cf-credstore-sdk-v0.1.0) - 2026-02-25
+
+### Added
+
+- *(credstore)* implement credstore module and credstore sdk, #106 (by @refur-nfn)
+
+### Contributors
+
+* @refur-nfn
+
+## [0.2.14](https://github.com/cyberfabric/cyberfabric-core/compare/cf-oagw-v0.2.13...cf-oagw-v0.2.14) - 2026-02-25
+
+### Added
+
+- *(oagw)* integrate authz-resolver and implement basic invocation check before proxying
+
+### Fixed
+
+- *(futures-util feature)* - Fix problem with feature unification for oagw crates (by @MikeFalcon77)
+
+### Other
+
+- OAGW SDK Extension (by @striped-zebra-dev) - #679
+- OAGW Unskip Failing Tests (by @striped-zebra-dev) - #675
+- OAGW Skip Failing Tests (by @striped-zebra-dev) - #673
+- OAGW Implementation (by @striped-zebra-dev) - #624
+- OAGW Implementation (by @striped-zebra-dev) - #624
+
+### Contributors
+
+* @MikeFalcon77
+* @striped-zebra-dev
+
+## [0.2.14](https://github.com/cyberfabric/cyberfabric-core/compare/cf-oagw-sdk-v0.2.13...cf-oagw-sdk-v0.2.14) - 2026-02-25
+
+### Added
+
+- *(oagw)* integrate authz-resolver and implement basic invocation check before proxying
+
+### Fixed
+
+- *(futures-util feature)* - Fix problem with feature unification for oagw crates (by @MikeFalcon77)
+
+### Other
+
+- OAGW SDK Extension (by @striped-zebra-dev) - #679
+- OAGW Implementation (by @striped-zebra-dev) - #624
+- OAGW Implementation (by @striped-zebra-dev) - #624
+- OAGW Design Changes #190 (by @striped-zebra-dev) - #527
+
+### Contributors
+
+* @MikeFalcon77
+* @striped-zebra-dev
+
+## [0.2.14](https://github.com/cyberfabric/cyberfabric-core/compare/cf-modkit-v0.2.13...cf-modkit-v0.2.14) - 2026-02-25
+
+### Fixed
+
+- fix tracing config optional (by @Bechma) - #723
+
+### Contributors
+
+* @Bechma
+
+## [0.1.3](https://github.com/cyberfabric/cyberfabric-core/compare/cf-static-tr-plugin-v0.1.2...cf-static-tr-plugin-v0.1.3) - 2026-02-25
+
+### Other
+
 - migrate modules from ArcSwapOption to OnceLock (by @aviator5) - #660
 
 ### Contributors
