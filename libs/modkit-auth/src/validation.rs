@@ -178,12 +178,15 @@ pub fn parse_timestamp(
 /// Helper to extract string from JSON value.
 ///
 /// # Errors
-/// Returns `ClaimsError::MissingClaim` if the value is not a string.
+/// Returns `ClaimsError::InvalidClaimFormat` if the value is not a string.
 pub fn extract_string(value: &serde_json::Value, field_name: &str) -> Result<String, ClaimsError> {
     value
         .as_str()
         .map(ToString::to_string)
-        .ok_or_else(|| ClaimsError::MissingClaim(field_name.to_owned()))
+        .ok_or_else(|| ClaimsError::InvalidClaimFormat {
+            field: field_name.to_owned(),
+            reason: "must be a string".to_owned(),
+        })
 }
 
 /// Extract audiences from a JSON value.
@@ -456,6 +459,26 @@ mod tests {
                 assert_eq!(field, "nbf");
             }
             other => panic!("expected InvalidClaimFormat for nbf overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_string_valid() {
+        let value = json!("hello");
+        assert_eq!(extract_string(&value, "field").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_extract_string_non_string_returns_invalid_claim_format() {
+        for value in [json!(42), json!(true), json!({"a": 1}), json!([1, 2])] {
+            let err = extract_string(&value, "my_field").unwrap_err();
+            match err {
+                ClaimsError::InvalidClaimFormat { field, reason } => {
+                    assert_eq!(field, "my_field");
+                    assert_eq!(reason, "must be a string");
+                }
+                other => panic!("expected InvalidClaimFormat, got {other:?}"),
+            }
         }
     }
 }
