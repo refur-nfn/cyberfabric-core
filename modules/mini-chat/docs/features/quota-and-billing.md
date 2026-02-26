@@ -87,7 +87,7 @@ Why the version matters:
 Minimum places to persist the applied version (P1):
 
 - `chat_turn.policy_version_applied`
-- `usage_outbox.policy_version_applied` (as part of the outbox payload/event)
+- `modkit_outbox_events.payload.policy_version_applied` (as part of the outbox payload/event)
 
 Contents (logically):
 

@@ -454,7 +454,7 @@ When a chat is deleted, the system MUST mark attachments for asynchronous cleanu
 **P1 scope**:
 
 - Mini Chat enforces credit-based quotas (daily, monthly) and performs downgrade: premium → standard → reject (`quota_exceeded`).
-- Integration is asynchronous: Mini Chat emits a usage event (via EventManager) after each turn reaches a terminal state. CyberChatManager consumes events and updates credit balances.
+- Integration is asynchronous: Mini Chat enqueues a usage event in a transactional outbox after each turn reaches a terminal state. A background dispatcher publishes it via the selected `minichat-quota-policy` plugin (`publish_usage(payload)`). CyberChatManager consumes these events and updates credit balances.
 - Usage events MUST be idempotent (keyed by `turn_id` / `request_id`).
 - No synchronous billing RPC is required during message execution.
 - All LLM invocations that take a quota reserve produce exactly one terminal billing event (completed, failed, or aborted), ensuring no credit drift under disconnect or crash scenarios. Pre-reserve failures (validation, authorization, quota preflight rejection) are not part of reserve settlement and do not require a billing event.
@@ -469,7 +469,7 @@ When a chat is deleted, the system MUST mark attachments for asynchronous cleanu
 - They MUST emit usage events attributed to a system bucket (or system actor) and MUST follow the same provider-id sanitization rules as user-initiated turns.
 - They MUST still obey global cost controls (tenant-level token budgets, kill switches) but are not part of per-user quota enforcement.
 
-**P1 mandatory**: the transactional usage outbox (`modkit_outbox_events`), CAS-guarded finalization, and the orphan turn watchdog are P1 requirements — they are required for billing event completeness (see DESIGN.md sections 5.2–5.5 and [usage-outbox.md](features/usage-outbox.md)).
+**P1 mandatory**: the transactional usage outbox (`modkit_outbox_events`), CAS-guarded finalization, and the orphan turn watchdog are P1 requirements — they are required for billing event completeness (see DESIGN.md sections 5.2–5.5 and [outbox-pattern.md](features/outbox-pattern.md)).
 
 **Deferred to P2+**: detailed billing integration contracts (formal event payload schemas, RPC interfaces, credit proxy endpoints). See DESIGN.md section 5.6 for the full deferral list.
 

@@ -1324,7 +1324,7 @@ Soft-delete rules:
 
 **Constraints**: UNIQUE on `(tenant_id, chat_id)`. NOT NULL on `provider`, `created_at`. `vector_store_id` is nullable (NULL while provider creation is in progress). One vector store per chat within a tenant.
 
-**Secure ORM**: `#[secure(owner_col = "chat_id", resource_col = "id", no_type)]`
+**Secure ORM**: `#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "id", no_type)]`
 
 **Concurrency invariants**:
 
@@ -2686,15 +2686,15 @@ Mini Chat enforces credit-based quotas (daily, monthly) and performs downgrade: 
 
 No synchronous billing RPC is required during message execution.
 
-After a turn reaches a terminal state, Mini Chat emits a usage event via EventManager. CyberChatManager consumes these events and updates credit balances. Usage events MUST be idempotent (keyed by `turn_id` / `request_id`) and MUST include the debited credits (plus provider token usage as telemetry).
+After a turn reaches a terminal state, Mini Chat enqueues a usage event in the transactional outbox and a background dispatcher publishes it via the selected `minichat-quota-policy` plugin (`publish_usage(payload)`). CyberChatManager consumes these events and updates credit balances. Usage events MUST be idempotent (keyed by `turn_id` / `request_id`) and MUST include the debited credits (plus provider token usage as telemetry).
 
 ### 5.2 Reliable Usage Event Publication (Outbox Pattern)
 
-**Problem**: after a turn completes, the domain service commits quota usage and must publish a usage event to EventManager. If the process crashes after the DB commit but before the event is published, the usage event is lost. CyberChatManager never learns about the consumed tokens, causing credit balance drift.
+**Problem**: after a turn completes, the domain service commits quota usage and must publish a usage event to the billing system. If the process crashes after the DB commit but before the event is durably persisted for delivery, the usage event is lost. CyberChatManager never learns about the consumed usage, causing credit balance drift.
 
 **Solution**: use a transactional outbox to guarantee at-least-once event delivery without introducing synchronous billing calls in the hot path.
 
-**Outbox storage**: Mini-Chat usage events are stored in the shared infrastructure table `modkit_outbox_events` owned by `modkit-db`. See [usage-outbox.md](features/usage-outbox.md) section 1.6 for the canonical table schema, column definitions, and indexes.
+**Outbox storage**: Mini-Chat usage events are stored in the shared infrastructure table `modkit_outbox_events` owned by `modkit-db`. See [outbox-pattern.md](features/outbox-pattern.md) section 1.6 for the canonical table schema, column definitions, and indexes.
 
 Mini-Chat usage events use:
 - `namespace = "mini-chat"`
@@ -2796,7 +2796,7 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 - **Duplicate publish**: the dispatcher may re-publish a row if it crashes after sending but before marking `delivered`. The consumer deduplicates using the idempotency key `(tenant_id, turn_id, request_id)` from the `dedupe_key`.
 - **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_failed_total` metric. Operators investigate and may replay manually or fix the root cause.
 
-**Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls. The canonical outbox table schema and API are defined in [usage-outbox.md](features/usage-outbox.md). Detailed event payload schemas and envelope definitions remain deferred to P2+ (see section 5.6).
+**Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls. The canonical outbox table schema and API are defined in [outbox-pattern.md](features/outbox-pattern.md). Detailed event payload schemas and envelope definitions remain deferred to P2+ (see section 5.6).
 
 ### 5.3 Turn Finalization Contract (P1): Quota Settlement and Outbox Emission
 
@@ -3168,7 +3168,7 @@ The terminal error after a disconnect is handled by the abort/watchdog finalizer
   - [Authorization Design](../../../docs/arch/authorization/DESIGN.md) - PDP/PEP model, predicate types, fail-closed rules, constraint compilation
 - **Features**: [features/](./features/) (planned)
 - **Internal**: [Quota & Billing](features/quota-and-billing.md) — quota and billing specification
-- **Internal**: [Usage Outbox](features/usage-outbox.md) — transactional usage outbox specification (P1)
+- **Internal**: [Outbox Pattern](features/outbox-pattern.md) — transactional outbox pattern specification (P1)
 
 ---
 

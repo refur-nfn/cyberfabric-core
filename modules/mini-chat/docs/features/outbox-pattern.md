@@ -1,5 +1,4 @@
-# Feature: Transactional Usage Outbox (Mini-Chat)
-
+ # Feature: Transactional Outbox Pattern
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-featstatus-usage-outbox`
 
 <!-- reference to DECOMPOSITION entry -->
@@ -9,47 +8,39 @@
 
 ### 1.1 Overview
 
-Mini-Chat emits usage snapshot events via a transactional outbox implemented in `modkit-db` (shared infra table `modkit_outbox_events`) so that billing/usage publishing is reliable and does not add synchronous network calls to the turn execution hot path.
+This feature describes the transactional outbox pattern implemented in `modkit-db` (shared infra table `modkit_outbox_events`) so that event publishing is reliable and does not add synchronous network calls to the critical execution hot path.
 
-This outbox is a **general-purpose infrastructure mechanism**: it is not mini-chat-specific.
-Mini-Chat uses it by publishing messages under a dedicated `(namespace, topic)` pair.
+The outbox is a **general-purpose infrastructure mechanism**.
+Modules use it by publishing messages under a dedicated `(namespace, topic)` pair.
 
 ### 1.2 Purpose
 
-This feature ensures the **Billing Event Completeness Invariant** from the Mini-Chat design: it MUST be impossible for committed quota debits to exist without a corresponding persisted outbox event.
+This feature ensures the **Outbox Completeness Invariant**: it MUST be impossible for committed side effects to exist without a corresponding persisted outbox event.
 
-It also ensures Mini-Chat can deliver usage snapshots to the selected `minichat-quota-policy` plugin asynchronously with at-least-once delivery semantics.
+It also ensures events can be delivered asynchronously with at-least-once delivery semantics.
 
 ### 1.3 Actors
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-mini-chat-actor-chat-user` | Initiates a streaming turn whose finalization MUST enqueue a usage outbox event (when a debit is applied). |
-| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | Internal background worker that claims pending outbox rows and publishes the usage snapshot to the selected quota-policy plugin with retries. |
-| `cpt-cf-mini-chat-actor-minichat-quota-policy-plugin` | Receives `publish_usage(...)` calls for usage snapshot events and forwards them to the billing system (idempotently). |
+| `cpt-cf-mini-chat-actor-chat-user` | Initiates an operation whose commit MUST enqueue an outbox event (when side effects are applied). |
+| `cpt-cf-mini-chat-actor-usage-outbox-dispatcher` | Background worker that claims pending outbox rows and publishes events to a downstream consumer with retries. |
+| `cpt-cf-mini-chat-actor-outbox-consumer` | Downstream event consumer that processes deliveries idempotently. |
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md)
-- **Design**: [DESIGN.md](../DESIGN.md)
-- **Dependencies**:
-  - `cpt-cf-mini-chat-fr-quota-enforcement`
-  - `minichat-quota-policy` plugin type (selected via ModKit ClientHub)
-  - ModKit lifecycle/stateful tasks documentation (stateful worker)
+- ModKit lifecycle/stateful tasks documentation (stateful worker)
 
 ### 1.5 Implementation Shape (normative)
 
-- Usage events are enqueued through `modkit_db::outbox::enqueue(runner, msg)` where `runner: &impl DBRunner`.
-- The enqueue call MUST run inside the same DB transaction as quota settlement (turn finalization).
+- Outbox events are enqueued through `modkit_db::outbox::enqueue(runner, msg)` where `runner: &impl DBRunner`.
+- The enqueue call MUST run inside the same DB transaction as the side effects the event describes.
 - A background dispatcher (ModKit `stateful` lifecycle task) claims events from `modkit_outbox_events` using a lease (`locked_by`, `locked_until`) and delivers them with retries.
-- Mini-Chat-specific usage events use:
-  - `namespace = "mini-chat"`
-  - `topic = "usage_snapshot"`
-  - `dedupe_key = Some("{tenant_id}/{turn_id}/{request_id}")` (stable idempotency key)
+- Producers SHOULD provide a stable `dedupe_key` to support idempotent enqueue and idempotent downstream processing.
 
 ### 1.6 Outbox Storage (normative)
 
-Mini-Chat usage events are stored in a shared infrastructure table owned by `modkit-db`:
+Outbox events are stored in a shared infrastructure table owned by `modkit-db`:
 
 `modkit_outbox_events`
 
@@ -82,7 +73,7 @@ Mini-Chat usage events are stored in a shared infrastructure table owned by `mod
 ### 1.7 Proposed `modkit_db::outbox` v1 API (sketch)
 
 This is the intended interface shape for the generalized outbox mechanism in `modkit-db`.
-Mini-Chat consumes this API; other modules can do the same with their own `namespace/topic`.
+Modules consume this API with their own `namespace/topic`.
 
 ```rust
 use modkit_db::secure::DBRunner;
@@ -138,49 +129,39 @@ where
 
 ## 2. Actor Flows (CDSL)
 
-### Turn Finalization Enqueues Usage Outbox Row
+### Operation Commit Enqueues Outbox Row
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-flow-usage-outbox-enqueue`
 
 **Actor**: `cpt-cf-mini-chat-actor-chat-user`
 
 **Success Scenarios**:
-- Turn completes, quota settlement is committed, and exactly one `modkit_outbox_events` row is inserted atomically with the settlement.
-- Turn is cancelled/disconnected (no terminal provider outcome), bounded best-effort debit is committed, and a `modkit_outbox_events` row is inserted atomically.
+ - An operation commits, and exactly one `modkit_outbox_events` row is inserted atomically.
 
 **Error Scenarios**:
-- The finalization CAS is lost (`rows_affected = 0`), so this execution MUST NOT debit quota and MUST NOT insert a `modkit_outbox_events` row.
-- The DB transaction fails: quota settlement and outbox insertion MUST both roll back.
+- The DB transaction fails: the described side effects and outbox insertion MUST both roll back.
 
 **Behavior (normative)**:
-- The outbox row insertion is part of the **Turn Finalization Contract**: it occurs only in the CAS-winning finalizer path and MUST be in the **same DB transaction** as quota settlement.
-- Within that finalization transaction:
-  - The system MUST attempt to transition the turn to a terminal state using the finalization CAS guard (see DESIGN).
-  - If the CAS update affects `1` row (CAS winner):
-    - The system MUST settle quota according to the outcome rules (actual usage when available, bounded estimate when not).
-    - The system MUST enqueue exactly one outbox event describing the settled usage snapshot.
-    - The transaction MUST commit only if both settlement and outbox insert succeed.
-  - If the CAS update affects `0` rows (CAS loser):
-    - The system MUST treat the turn as already finalized and MUST NOT debit quota.
-    - The system MUST NOT insert an outbox event.
+- The outbox row insertion is part of the operation's commit: it MUST be in the **same DB transaction** as the committed side effects.
+- Within that transaction:
+  - The system MUST enqueue exactly one outbox event describing the committed side effects.
+- If an operation implementation uses a uniqueness guard for idempotent enqueue (e.g. a stable `dedupe_key` with a unique index):
+  - A conflict on insert MUST be treated as "already enqueued".
 - If the transaction fails/rolls back for any reason:
-  - No quota debit is committed.
   - No `modkit_outbox_events` row is persisted.
 
 **Payload requirements**:
-- The outbox payload MUST include `policy_version_applied` from the policy snapshot used for the turn.
-- The payload MUST include sufficient identifiers for idempotent billing publish (at minimum: `tenant_id`, `turn_id`, `request_id`; and `user_id` when applicable).
-- The outbox row MUST include a stable `dedupe_key` derived from `(tenant_id, turn_id, request_id)`.
-- The payload MUST NOT contain provider identifiers (per Mini-Chat provider-id sanitization rules).
+- The outbox payload MUST include sufficient identifiers for idempotent downstream processing.
+- The outbox row SHOULD include a stable `dedupe_key` suitable for idempotency.
 
-### Usage Outbox Dispatcher Publishes Usage Snapshot
+### Outbox Dispatcher Publishes Events
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
 
 **Actor**: `cpt-cf-mini-chat-actor-usage-outbox-dispatcher`
 
 **Success Scenarios**:
-- Pending outbox rows are claimed using `FOR UPDATE SKIP LOCKED` and published to the selected quota-policy plugin.
+ - Pending outbox rows are claimed using `FOR UPDATE SKIP LOCKED` and published to the downstream consumer.
 - Claimed rows are marked `delivered` on success.
 
 **Error Scenarios**:
@@ -194,7 +175,7 @@ where
 - Claimed rows MUST be leased using `(locked_by, locked_until)` so that:
   - A crashing worker does not permanently strand a row.
   - Another worker can reclaim a row after lease expiry.
-- For each claimed row, the dispatcher MUST call the selected `minichat-quota-policy` plugin API to publish usage (e.g., `publish_usage(payload)`).
+- For each claimed row, the dispatcher MUST publish the outbox payload to the downstream consumer.
 - On publish success, the row MUST transition to `delivered` and be made ineligible for further dispatch.
 - On publish failure, the row MUST be returned to `pending` and rescheduled by setting `next_attempt_at` using a retry policy, while recording `attempts` and `last_error`.
 
@@ -209,38 +190,31 @@ where
 
 **Idempotency requirement**:
 - The dispatcher MUST assume at-least-once delivery.
-- Downstream billing publish MUST be idempotent on a stable key derived from `(tenant_id, turn_id, request_id)`.
+- Downstream processing MUST be idempotent on a stable key (e.g. the outbox `dedupe_key`).
 
 ## 3. Processes / Business Logic (CDSL)
 
-### Enqueue Usage Outbox Row (Transactional)
+### Enqueue Outbox Row (Transactional)
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-algo-usage-outbox-enqueue`
 
 **Input**:
-- Turn finalization outcome (completed/failed/aborted)
-- Settled usage (actual or bounded estimate)
-- Policy snapshot fields (including `policy_version_applied`)
-- Identifiers (tenant_id, user_id (if applicable), turn_id, request_id)
+- Operation outcome (completed/failed/aborted)
+- Committed side effects summary (module-defined)
+- Identifiers used for idempotency and downstream correlation
 
 **Output**:
-- Persisted `modkit_outbox_events` row inserted atomically with quota settlement
+- Persisted `modkit_outbox_events` row inserted atomically with the committed side effects
 
 **Requirements**:
-- The enqueue operation MUST run inside the same DB transaction as quota settlement.
-- The outbox row MUST be written only by the CAS-winning finalizer.
+- The enqueue operation MUST run inside the same DB transaction as the described side effects.
 - The outbox payload MUST be derived from already-validated internal state (no client-provided usage fields).
 - Enqueue MUST be idempotent on `dedupe_key` when it is provided:
-  - Multiple finalization attempts for the same turn/request MUST NOT produce multiple outbox rows.
+  - Multiple attempts to enqueue the same logical event MUST NOT produce multiple outbox rows.
   - This is implemented in storage via the dedupe unique index and an upsert/ignore-on-conflict insert.
-- The outbox payload MUST include:
-  - `policy_version_applied`
-  - effective model / model identifier used for the settled turn
-  - settled usage counters (tokens, and any additional counters required by quota policy)
-  - identifiers required for idempotency (tenant_id, turn_id, request_id; plus user_id when applicable)
+- The outbox payload MUST include all information needed by the downstream consumer.
 - The outbox row MUST be initialized with:
-  - `namespace = "mini-chat"`
-  - `topic = "usage_snapshot"`
+  - `namespace` and `topic` appropriate for the producer
   - `status = 'pending'`
   - `attempts = 0`
   - `next_attempt_at = now()`
@@ -318,11 +292,11 @@ where
 
 ## 5. Definitions of Done
 
-### Provide Transactional Usage Outbox Persistence
+### Provide Transactional Outbox Persistence
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-transactional`
 
-The system **MUST** persist a `modkit_outbox_events` row in the same DB transaction as any quota settlement that debits usage.
+The system **MUST** persist a `modkit_outbox_events` row in the same DB transaction as any committed side effects described by that event.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-enqueue`
@@ -330,7 +304,6 @@ The system **MUST** persist a `modkit_outbox_events` row in the same DB transact
 
 **Touches**:
 - DB: `modkit_outbox_events`
-- Entities: `chat_turns`, `quota_usage`
 
 ### Provide Stateful Usage Outbox Dispatcher
 
@@ -349,26 +322,24 @@ The system **MUST** run a background dispatcher as a stateful lifecycle task tha
 
 **Touches**:
 - DB: `modkit_outbox_events`
-- Integration: `minichat-quota-policy` plugin
 
 ### Enforce Idempotent Publish Contract
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-usage-outbox-idempotency`
 
-The system **MUST** ensure that usage snapshot delivery is safe under retries and replays by using a stable dedupe key (tenant_id/turn_id/request_id) and requiring the downstream billing publish operation to be idempotent on that key.
+The system **MUST** ensure that event delivery is safe under retries and replays by using a stable dedupe key and requiring downstream processing to be idempotent on that key.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-usage-outbox-dispatch`
 
 **Touches**:
 - DB: `modkit_outbox_events` (dedupe key)
-- Integration: billing publish semantics via `minichat-quota-policy`
 
 ## 6. Acceptance Criteria
 
-- [ ] For any committed quota debit, there exists exactly one corresponding persisted `modkit_outbox_events` row for the turn (same DB transaction boundary).
-- [ ] If a finalizer loses the CAS race, it does not debit quota and does not insert a `modkit_outbox_events` row.
+- [ ] For any committed side effects that require an event, there exists exactly one corresponding persisted `modkit_outbox_events` row (same DB transaction boundary).
+- [ ] If a producer loses an idempotency race, it does not insert a duplicate `modkit_outbox_events` row.
 - [ ] Dispatcher can run concurrently (multiple replicas) without double-processing rows (verified via `SKIP LOCKED` + lease).
 - [ ] If the dispatcher crashes after claiming rows, those rows become eligible for reclaim after lease expiry.
 - [ ] Publish failures reschedule rows with increasing `next_attempt_at` and record `last_error`.
-- [ ] Publishing is safe under retries (downstream `publish_usage` is idempotent on dedupe key).
+- [ ] Publishing is safe under retries (downstream processing is idempotent on dedupe key).
