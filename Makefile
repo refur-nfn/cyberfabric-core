@@ -352,7 +352,7 @@ coverage-unit:
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local:
-	python scripts/check_local_env.py --mode e2e-local
+	python3 scripts/check_local_env.py --mode e2e-local
 
 # Generate code coverage report (e2e-local tests only)
 coverage-e2e-local: check-prereq-e2e-local
