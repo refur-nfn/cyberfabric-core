@@ -21,6 +21,8 @@ This invariant applies only to domain operations that are defined to emit outbox
 
 It also ensures events can be delivered asynchronously with at-least-once delivery semantics.
 
+**Scope clarification**: The Outbox Completeness Invariant covers *transactional persistence* of the outbox row — not end-to-end delivery. A row that reaches `dead` status (section 4) satisfies the persistence invariant but represents a delivery failure. Dead rows MUST be surfaced via operational monitoring (see DoD `cpt-cf-mini-chat-dod-usage-outbox-dispatcher`); manual replay or escalation is outside the scope of this feature.
+
 ### 1.3 Actors
 
 | Actor | Role in Feature |
@@ -61,7 +63,7 @@ Outbox events are stored in a shared infrastructure table owned by `modkit-db`:
 - `locked_until timestamptz null`
 - `last_error text null`
 - `created_at timestamptz not null default now()`
-- `updated_at timestamptz not null default now()`
+- `updated_at timestamptz not null default now()` — MUST be set to `now()` by application code on every state transition (`claim`, `ack`, `nack`). Not managed by a DB trigger.
 
 **Indexes (minimum)**:
 
@@ -77,9 +79,11 @@ Outbox events are stored in a shared infrastructure table owned by `modkit-db`:
 The `tenant_id` column and the `dedupe_key` field serve different roles and MUST NOT be conflated:
 
 - **`tenant_id` column** — used for routing, filtering, and downstream partitioning. The dispatcher MAY use it to scope claim queries to a specific tenant. Downstream consumers MAY use it for partition-aware processing. It is nullable to accommodate system-level events that are not tenant-scoped.
-- **`dedupe_key`** — a producer-defined idempotency key whose structure is domain-specific. The partial unique index on `(namespace, topic, dedupe_key)` enforces at-most-once enqueue at the database level. In the Mini Chat domain, the canonical format is `"{tenant_id}/{turn_id}/{request_id}"` (see DESIGN.md section 5.6). Downstream consumers MUST use the same canonical tuple `(tenant_id, turn_id, request_id)` — extracted from the `dedupe_key` or from the payload — for idempotent processing.
+- **`dedupe_key`** — a producer-defined idempotency key whose structure is domain-specific. The partial unique index on `(namespace, topic, dedupe_key)` enforces at-most-once enqueue at the database level. **Mini-Chat-specific (not general-purpose):** In the Mini Chat domain, the canonical format is `"{tenant_id}/{turn_id}/{request_id}"` (see DESIGN.md section 5.6). Mini Chat downstream consumers MUST use the same canonical tuple `(tenant_id, turn_id, request_id)` — extracted from the `dedupe_key` or from the payload — for idempotent processing. Other modules define their own `dedupe_key` format and idempotency extraction rules in their respective feature specs.
 
 The presence of `tenant_id` as a table column does not replace domain-level idempotency semantics embedded in `dedupe_key`. The two serve different purposes and MUST remain consistent: when both are populated, the `tenant_id` value in the column MUST match the tenant component of the `dedupe_key`.
+
+**Enforcement**: The `enqueue` function (section 1.7) MUST validate this consistency at enqueue time. If `tenant_id` is `Some` and `dedupe_key` is `Some`, the function MUST verify that the `dedupe_key` string begins with the hex representation of `tenant_id` followed by `"/"`. On mismatch, `enqueue` MUST return an error; the row MUST NOT be inserted.
 
 ### 1.7 Proposed `modkit_db::outbox` v1 API (sketch)
 
@@ -109,6 +113,9 @@ pub async fn enqueue(
 pub struct ClaimCfg {
     pub batch_size: u32,
     pub lease_duration: Duration,
+    /// Maximum total delivery attempts (including the first).
+    /// Claim query excludes rows where `attempts >= max_attempts`.
+    /// Same value used by retry logic (section 3) for dead-lettering.
     pub max_attempts: u32,
 }
 
@@ -182,11 +189,13 @@ where
 **Behavior (normative)**:
 - The dispatcher is an internal background worker (implemented as a ModKit stateful lifecycle task).
 - It MUST periodically poll for publishable outbox rows and process them until a shutdown `CancellationToken` is triggered.
+  - **Polling interval**: configurable per-dispatcher via `poll_interval: Duration` (runtime configuration, supplied by the deploying module). No hardcoded default in this spec. The polling interval MUST be significantly less than `lease_duration` (recommended: `poll_interval <= lease_duration / 3`) to avoid spurious lease-expiry reclaims.
 - Claiming MUST be safe under concurrency (multiple replicas/workers) and MUST use row-level locking via `FOR UPDATE SKIP LOCKED`.
 - Claimed rows MUST be leased using `(locked_by, locked_until)` so that:
   - A crashing worker does not permanently strand a row.
   - Another worker can reclaim a row after lease expiry.
 - For each claimed row, the dispatcher MUST publish the outbox payload to the downstream consumer.
+  - **"Publish" definition**: Publish is an abstract operation supplied by the consuming module as a callback (e.g., `async fn(ClaimedMessage) -> Result<(), PublishError>`). The transport mechanism (in-process function call, HTTP, message queue) is module-defined and outside the scope of this spec. The dispatcher treats the callback return value as the publish outcome: `Ok(())` = success, `Err(...)` = failure. The dispatcher MUST NOT interpret payload contents.
 - On publish success, the row MUST transition to `delivered` and be made ineligible for further dispatch.
 - On publish failure, the row MUST be returned to `pending` and rescheduled by setting `next_attempt_at` using a retry policy, while recording `attempts` and `last_error`.
 
@@ -198,6 +207,7 @@ where
   - `ack(id)`
   - `nack(id, err)`
 - `ack` MUST only succeed for rows currently leased by the same worker (guarded by `locked_by`).
+- If `ack` fails the lease guard (row not leased by this worker, or lease expired and reclaimed by another worker), `ack` MUST return an error. The dispatcher MUST log the error and MUST NOT treat this as a publish failure requiring `nack`. The row is now owned by another worker or already delivered; no further action by this worker.
 
 **Idempotency requirement**:
 - The dispatcher MUST assume at-least-once delivery.
@@ -213,6 +223,8 @@ where
 - Operation outcome (completed/failed/aborted)
 - Committed side effects summary (module-defined)
 - Identifiers used for idempotency and downstream correlation
+
+**Caller responsibility**: The `enqueue` function persists whatever message it receives; it does not inspect or filter by outcome. The *caller* (domain operation code) is responsible for deciding whether a given outcome requires an outbox event. The set of outbox-requiring outcomes is defined by each consuming module (see section 1.2). If the caller determines that no event is needed (e.g., a pre-reserve validation failure), it simply does not call `enqueue`.
 
 **Output**:
 - Persisted `modkit_outbox_events` row inserted atomically with the committed side effects
@@ -245,16 +257,17 @@ where
 
 **Requirements**:
 - Claim MUST be performed in a DB transaction.
-- Only rows eligible for dispatch MAY be claimed:
-  - `status = 'pending'`
-  - `next_attempt_at <= now()`
-  - and either the row is unclaimed, or any previous lease is expired.
+- Only rows eligible for dispatch MAY be claimed. The claim WHERE clause MUST match rows satisfying:
+  - (`status = 'pending'` AND `next_attempt_at <= now()`)
+  - OR (`status = 'processing'` AND `locked_until < now()`) — this covers lease-expired rows from crashed workers; the claim query atomically reclaims them. No separate recovery actor or sweep is required.
+  - In both cases: `attempts < max_attempts` (from `ClaimCfg`; rows at or above the limit are ineligible and MUST be transitioned to `dead` by the dispatcher on next encounter or by a periodic sweep).
 - The claim query MUST lock selected rows using `FOR UPDATE SKIP LOCKED`.
-- Upon claim, the worker MUST:
-  - transition row to `processing`
-  - increment `attempts`
+- Upon claim, the worker MUST atomically:
+  - transition row to `processing` (or keep `processing` if reclaiming an expired lease)
+  - increment `attempts` — this is the **total delivery attempt count**, starting from 0 on insert. After the first claim, `attempts = 1`. `max_attempts = 3` means at most 3 delivery attempts; the row is dead-lettered when `attempts >= max_attempts`.
   - set `locked_by = worker_id`
   - set `locked_until = now() + lease_duration`
+  - set `updated_at = now()`
 - Claim ordering MUST be deterministic (e.g., `ORDER BY created_at ASC, id ASC`) to reduce starvation risk.
 - Claim MUST support multiple workers without double-claiming the same row.
 
@@ -273,8 +286,19 @@ where
 **Requirements**:
 - On publish failure, the dispatcher MUST record `last_error`.
 - The dispatcher MUST clear any claim lease when rescheduling: `locked_by = NULL`, `locked_until = NULL`.
-- The dispatcher MUST compute `next_attempt_at` using exponential backoff with jitter, bounded by a configured maximum.
-- If `attempts` exceeds `max_attempts`, the dispatcher MUST transition the row to `dead` and MUST NOT retry it automatically.
+- The dispatcher MUST compute `next_attempt_at` using exponential backoff with jitter, bounded by a configured maximum:
+
+  > `delay = min(base_delay * 2^(attempts - 1), max_delay)`
+  > `jittered_delay = uniform_random(delay / 2, delay)`
+  > `next_attempt_at = now() + jittered_delay`
+  >
+  > Where:
+  > * `base_delay` — minimum retry interval. Runtime configuration supplied by the deploying module (e.g., 1 s). Immutable per dispatcher instance.
+  > * `max_delay` — upper bound on computed delay before jitter. Runtime configuration supplied by the deploying module (e.g., 300 s). Immutable per dispatcher instance.
+  > * `attempts` — current value of the row's `attempts` column (persisted, incremented at claim time per section 3 claim algo).
+  > * Jitter: uniform random over `[delay/2, delay]` (equal-jitter strategy). Bounding is applied before jitter: `delay` is clamped to `max_delay` first, then jitter is applied to the clamped value.
+
+- If `attempts >= max_attempts`, the dispatcher MUST transition the row to `dead` and MUST NOT retry it automatically. `max_attempts` is the same value as `ClaimCfg.max_attempts` (section 1.7); it represents total delivery attempts. Runtime configuration supplied by the deploying module, immutable per dispatcher instance.
 
 ## 4. States (CDSL)
 
@@ -293,7 +317,7 @@ where
 - `processing`:
   - Row is claimed by a dispatcher and has an active lease (`locked_until`).
   - Row may be re-published in crash scenarios (at-least-once delivery).
-  - If `now() > locked_until`, the row becomes reclaimable (it may be transitioned back to `pending`).
+  - If `now() > locked_until`, the row becomes reclaimable. The claim query (section 3, `cpt-cf-mini-chat-algo-usage-outbox-claim`) handles this inline: it includes `processing` rows with expired leases in its WHERE clause and atomically reclaims them. No separate recovery actor or sweep is required for the `processing → processing` (re-lease) transition.
 - `delivered`:
   - Terminal state.
   - Row MUST NOT transition out of `delivered`.

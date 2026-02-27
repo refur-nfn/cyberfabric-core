@@ -215,7 +215,7 @@ token_budget = min(configured_max_input_tokens, effective_model_context_window �
 Where:
 - `configured_max_input_tokens` — deployment config hard cap
 - `effective_model_context_window` — from model catalog entry for the resolved effective_model (see `context_window` field)
-- `reserved_output_tokens` — `max_output_tokens` configured for the request
+- `reserved_output_tokens` — `max_output_tokens` configured for the request (persisted as `chat_turns.max_output_tokens_applied`)
 
 When context exceeds the budget, the system truncates in reverse priority: retrieval excerpts first, then document summaries, then old messages (not summary). Thread summary and system prompt are never truncated.
 
@@ -354,15 +354,15 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-component-quota-service`
 
-- **quota_service** — Enforces per-user credit-based rate limits per tier across multiple periods (daily, monthly), tracked in real-time. Credits are computed from provider-reported token usage using the model credit multipliers in the policy snapshot. Premium models have stricter limits; standard-tier models have separate, higher limits. Tracks per-tier call counts, file search call counts, web search call counts, and image usage counters (image_inputs, image_upload_bytes) separately. Uses **two-phase quota counting**:
+- **quota_service** — Enforces per-user credit-based rate limits per tier across multiple periods (daily, monthly), tracked in real-time via bucket rows in `quota_usage` (section 3.7). Credits are computed from provider-reported token usage using the model credit multipliers in the policy snapshot. Premium models have stricter limits (bucket `tier:premium`); standard-tier limits serve as the overall cap (bucket `total`). Tracks call counts, file search call counts, web search call counts, and image usage counters (image_inputs, image_upload_bytes) as telemetry on bucket rows. Uses **two-phase quota counting**:
 
   **Tier availability rule**: a tier is considered **available** only if it has remaining quota in **ALL** configured periods for that tier. If **ANY** period is exhausted, the tier is treated as exhausted and the downgrade cascade continues to the next tier. When all tiers are exhausted, the system rejects with `quota_exceeded`.
 
-  - **Phase 1 - Preflight (reserve) estimate** (on request start, before any streaming begins and before outbound call): estimate token usage from `ContextPlan` size + `max_output_tokens`, convert to reserved credits using model multipliers, and reserve credits for quota enforcement. Decision: allow at requested tier / downgrade to next tier / reject if all tiers exhausted.
+  - **Phase 1 - Preflight (reserve) estimate** (on request start, before any streaming begins and before outbound call): estimate token usage from `ContextPlan` size + `max_output_tokens` (persisted as `max_output_tokens_applied`), convert to reserved credits using model multipliers (section 5.4.1), and reserve credits for quota enforcement. Decision: allow at requested tier / downgrade to next tier / reject if all tiers exhausted.
     - Reserve MUST prevent parallel requests from overspending remaining tier quota.
-    - Reserve SHOULD be keyed by `(tenant_id, user_id, period_type, period_start)` and reconciled on terminal outcome. Reserves MUST be checked across all configured period types (`daily`, `monthly`) for the current tier; if any period is exhausted, the tier is considered exhausted and the cascade proceeds to the next tier.
+    - Reserve SHOULD be keyed by `(tenant_id, user_id, period_type, period_start, bucket)` and reconciled on terminal outcome. Reserves MUST be checked across all configured period types (`daily`, `monthly`) and all required buckets for the current tier; if any period or bucket is exhausted, the tier is considered exhausted and the cascade proceeds to the next tier.
   - **Phase 2 - Commit actual** (on `event: done`): reconcile the reserve to actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`), compute actual credits via model multipliers, and commit actual credits to `quota_usage`. If actual exceeds estimate (overshoot), the completed response is never retroactively cancelled, but guardrails apply:
-    - Commit MUST be atomic per `(tenant_id, user_id, period_type, period_start)` (avoid race conditions under parallel streams)
+    - Commit MUST be atomic per `(tenant_id, user_id, period_type, period_start, bucket)` row (avoid race conditions under parallel streams)
     - If the remaining quota for a tier is below a configured negative threshold, preflight MUST downgrade new requests to the next tier in the cascade. The negative threshold is a configurable absolute credit value defined in quota configuration.
     - `max_output_tokens` and an explicit input budget MUST bound the maximum cost per request
   - **Streaming constraint**: quota check is preflight-only. Mid-stream abort due to quota is NOT supported (would produce broken UX and partial content). Mid-stream abort is only triggered by: user cancel, provider error, or infrastructure limits.
@@ -1239,7 +1239,11 @@ Tracks idempotency and in-progress generation state for `request_id`. This avoid
 | provider_response_id | VARCHAR(128) | Provider response ID (nullable) |
 | assistant_message_id | UUID | Persisted assistant message ID (nullable until completed) |
 | error_code | VARCHAR(64) | Terminal error code (nullable) |
-| reserve_tokens | BIGINT | Preflight token reserve (`estimated_input_tokens + max_output_tokens`). Persisted at preflight before any outbound provider call. Nullable - NULL only for turns that fail before a reserve is taken (pre-reserve failures). Immutable after insert. Used for deterministic reconciliation under ABORTED and post-provider-start FAILED outcomes (sections 5.7, 5.8, 5.9). |
+| reserve_tokens | BIGINT | Preflight token reserve (`estimated_input_tokens + max_output_tokens_applied`). Persisted at preflight before any outbound provider call. Nullable - NULL only for turns that fail before a reserve is taken (pre-reserve failures). Immutable after insert. Used for deterministic reconciliation under ABORTED and post-provider-start FAILED outcomes (sections 5.7, 5.8, 5.9). |
+| max_output_tokens_applied | INTEGER | The `max_output_tokens` value used at preflight for this turn. Persisted at preflight (same time as `reserve_tokens`). Nullable — NULL only for pre-reserve failures. Immutable after insert. Required for deterministic derivation of `estimated_input_tokens` at settlement time: `estimated_input_tokens = reserve_tokens - max_output_tokens_applied` (sections 5.8, 5.9). |
+| reserved_credits_micro | BIGINT | Worst-case credit reserve computed at preflight: `credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)` where `estimated_input_tokens = reserve_tokens - max_output_tokens_applied` (section 5.4.1), using multipliers from the policy snapshot identified by `policy_version_applied`. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Used for reserve release/reconciliation at settlement (section 5.4.4). |
+| policy_version_applied | BIGINT | Monotonic version of the policy snapshot (section 5.2.1) used for this turn's preflight reserve, tier selection, and settlement. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Required for deterministic credit computation at settlement and for CCM billing reconciliation. |
+| effective_model | VARCHAR(64) | Model resolved at preflight after quota downgrade cascade. Persisted at preflight. Nullable — NULL only for pre-reserve failures. Immutable after insert. Also recorded on `messages.model` for the assistant message. |
 | deleted_at | TIMESTAMPTZ | Soft-delete timestamp for turn mutations (nullable). Set when a turn is replaced by retry or edit, or explicitly deleted. |
 | replaced_by_request_id | UUID | `request_id` of the new turn that replaced this one via retry or edit (nullable). Stored on the old (soft-deleted) turn to provide audit traceability. Not used by delete. |
 | started_at | TIMESTAMPTZ | DB-assigned turn creation timestamp (set on INSERT). Used for ordering and latest-turn selection in P1. |
@@ -1338,7 +1342,7 @@ Soft-delete rules:
 
 **Constraints**: UNIQUE on `(tenant_id, chat_id)`. NOT NULL on `provider`, `created_at`. `vector_store_id` is nullable (NULL while provider creation is in progress). One vector store per chat within a tenant.
 
-**Secure ORM**: `#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "id", no_type)]`
+**Secure ORM**: No independent `#[secure]` — accessed through parent chat. The table has no `user_id` column; owner isolation is inherited from chat-level scoping (`chat_id` obtained from a scoped chat query). All queries MUST include `tenant_id` in the WHERE clause (enforced by the chat-level `AccessScope`).
 
 **Concurrency invariants**:
 
@@ -1353,6 +1357,8 @@ Soft-delete rules:
 - The system MUST NOT reuse a vector store across tenants or across chats. Each row binds exactly one provider vector store to one `(tenant_id, chat_id)` pair.
 - All queries against `chat_vector_stores` MUST include `tenant_id` in the WHERE clause (enforced by `AccessScope` scoping).
 - The system MUST NOT allow any code path to look up, query, or reference a vector store row belonging to a different tenant.
+
+**Implementation note (normative)**: direct access to `chat_vector_stores` by primary key (`id`) or by `vector_store_id` alone is **forbidden** in request-handling code. All access MUST go through chat-scoped repository methods that enforce `(tenant_id, user_id, chat_id)` via `AccessScope` — typically by first loading the parent chat through a scoped query and then joining or filtering `chat_vector_stores` on `(tenant_id, chat_id)`. Any query against this table that does not include `tenant_id` and a chat-scoped join (or equivalent proven chat-scope guarantee) is a tenant-isolation violation. Background jobs (cleanup worker, orphan reaper) that operate outside a user `AccessScope` MUST still include `tenant_id` in every query.
 
 **Creation protocol (P1, insert-first get-or-create):**
 
@@ -1405,24 +1411,42 @@ If the chat is soft-deleted before vector store creation completes, the creation
 | user_id | UUID | User |
 | period_type | VARCHAR(16) | `daily` or `monthly` (P2+: `4h`, `weekly`) |
 | period_start | DATE | Start of the period |
-| input_tokens | BIGINT | Total input tokens consumed |
-| output_tokens | BIGINT | Total output tokens consumed |
-| file_search_calls | INTEGER | Number of file search tool calls |
-| web_search_calls | INTEGER | Number of web search tool calls (P1) |
-| rag_retrieval_calls | INTEGER | Number of internal RAG retrieval calls (P2+) |
-| premium_tier_calls | INTEGER | Calls to premium-tier models (e.g., GPT-5.x) |
-| standard_tier_calls | INTEGER | Calls to standard-tier models (e.g., GPT-5 Mini) |
-| image_inputs | INTEGER | Number of image attachments included in Responses API calls (default 0) |
-| image_upload_bytes | BIGINT | Total bytes of uploaded images (default 0) |
+| bucket | VARCHAR(32) | Quota enforcement scope. NOT NULL. Canonical values: `total` (overall cap — includes all tiers), `tier:premium` (premium-only subcap). A `tier:standard` bucket MAY exist for analytics but MUST NOT be required for enforcement correctness. |
+| spent_credits_micro | BIGINT | Total committed (settled) credits in micro-credits for this bucket (default 0). Incremented atomically at settlement by `actual_credits_micro` (section 5.4.4). This is the credit-denominated enforcement counter. |
+| reserved_credits_micro | BIGINT | Sum of in-flight (unsettled) credit reserves for this bucket (default 0). Incremented at preflight by the turn's `reserved_credits_micro`; decremented at settlement by the same amount (section 5.4.3–5.4.4). Used to prevent parallel requests from overspending. |
+| calls | INTEGER | Number of completed turns settled against this bucket (default 0). Incremented by 1 at settlement. In bucket `total` this counts all turns; in bucket `tier:premium` only premium-tier turns. Telemetry only — NOT used for enforcement. |
+| input_tokens | BIGINT | Total input tokens consumed (default 0). Updated only in bucket `total`. Telemetry only — NOT used for enforcement. |
+| output_tokens | BIGINT | Total output tokens consumed (default 0). Updated only in bucket `total`. Telemetry only — NOT used for enforcement. |
+| file_search_calls | INTEGER | Number of file search tool calls (default 0). Updated only in bucket `total`. |
+| web_search_calls | INTEGER | Number of web search tool calls (P1) (default 0). Updated only in bucket `total`. |
+| rag_retrieval_calls | INTEGER | Number of internal RAG retrieval calls (P2+) (default 0). Updated only in bucket `total`. |
+| image_inputs | INTEGER | Number of image attachments included in Responses API calls (default 0). Updated only in bucket `total`. |
+| image_upload_bytes | BIGINT | Total bytes of uploaded images (default 0). Updated only in bucket `total`. |
 | updated_at | TIMESTAMPTZ | Last update time |
 
-Commit semantics: quota updates MUST be atomic per period record. Implementations SHOULD use a transaction with row locking or a single UPDATE statement to avoid race conditions under parallel streams. Image accounting: on each turn that includes images, increment `image_inputs` by the number of images in the request. On each image upload, increment `image_upload_bytes` by the uploaded file size. Preflight checks MUST validate `image_upload_bytes` caps on upload requests and MUST validate `image_inputs` caps on send-message requests (plus any optional per-turn byte caps computed from attachment metadata).
+**Bucket model**: each `(tenant_id, user_id, period_type, period_start)` combination has **one row per bucket**. The `total` bucket is the overall cap (all tiers). The `tier:premium` bucket tracks premium-only spend. Enforcement reads at most two rows per period; see section 5.4.2 for the availability algorithm.
+
+**Credit vs. token/call columns**: `spent_credits_micro` and `reserved_credits_micro` are the enforcement counters used by `quota_service` for tier availability checks and period limit enforcement (section 5.4.2). All other counters (`input_tokens`, `output_tokens`, `calls`, `file_search_calls`, `web_search_calls`, `image_inputs`, `image_upload_bytes`) are aggregate telemetry; they are NOT used for quota enforcement decisions.
+
+**Commit semantics**: quota updates MUST be atomic per bucket row. Implementations SHOULD use a transaction with row locking or a single UPDATE statement to avoid race conditions under parallel streams.
+
+- **At preflight (reserve)**:
+  - Always: `quota_usage[bucket='total'].reserved_credits_micro += turn_reserved_credits_micro` for each applicable period row.
+  - If effective tier is premium: also `quota_usage[bucket='tier:premium'].reserved_credits_micro += turn_reserved_credits_micro` for each applicable period row.
+  - Standard-tier turns do NOT require a `tier:premium` row update.
+
+- **At settlement (commit)**:
+  - Always (bucket `total`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += actual_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`.
+  - If the turn ran on premium tier (bucket `tier:premium`): `reserved_credits_micro -= turn_reserved_credits_micro; spent_credits_micro += actual_credits_micro; calls += 1`.
+  - Token telemetry counters (`input_tokens`, `output_tokens`) are updated only in bucket `total`.
+
+Both operations MUST target the correct `(tenant_id, user_id, period_type, period_start, bucket)` row(s) within the finalization transaction. Image accounting: on each turn that includes images, increment `image_inputs` by the number of images in the request on the `total` bucket row. On each image upload, increment `image_upload_bytes` by the uploaded file size on the `total` bucket row. Preflight checks MUST validate `image_upload_bytes` caps on upload requests and MUST validate `image_inputs` caps on send-message requests (plus any optional per-turn byte caps computed from attachment metadata).
 
 **PK**: `id`
 
-**Constraints**: UNIQUE on `(tenant_id, user_id, period_type, period_start)`.
+**Constraints**: UNIQUE on `(tenant_id, user_id, period_type, period_start, bucket)`.
 
-**Indexes**: `(tenant_id, user_id, period_type, period_start)` for quota lookups
+**Indexes**: `(tenant_id, user_id, period_type, period_start, bucket)` for quota lookups
 
 **Secure ORM**: `#[secure(tenant_col = "tenant_id", owner_col = "user_id", resource_col = "id", no_type)]`
 
@@ -1946,7 +1970,7 @@ token_budget = min(configured_max_input_tokens, effective_model.context_window -
 
 **Determinism note**: given identical inputs (same message history, same retrieval results, same model context window), the truncation algorithm MUST produce the same `ContextPlan`. This property is important for debugging and idempotent retry scenarios. Determinism applies to truncation and ordering logic given identical retrieval inputs. Retrieval results themselves may vary depending on provider behavior.
 
-**Link to quota preflight**: the token estimate used for quota reservation (see "Quota counting flow" above) is computed from the final truncated `ContextPlan` size plus `max_output_tokens`.
+**Link to quota preflight**: the token estimate used for quota reservation (section 5.4.1) is computed from the final truncated `ContextPlan` size (plus surcharges) as `estimated_input_tokens`, combined with `max_output_tokens_applied` to form `reserve_tokens`.
 
 #### ContextPlan Determinism and Snapshot Boundary (P1)
 
@@ -2141,7 +2165,7 @@ model_catalog:
 - `context_window` replaces the previous `context_limit` field in credit budget computation.
 - The catalog is read at startup and reloaded on configuration change. Runtime model resolution uses the in-memory catalog (only enabled models).
 
-Operational configuration of rate limits, quota allocations, and model catalog is managed by Product Operations. See **#CON-001** for configuration management details.
+Operational configuration of rate limits, quota allocations, and model catalog is managed by Product Operations. Configuration management processes are external to this design document; the configuration owner and change management workflow are defined by the platform operations team.
 
 #### Configuration Validation Rules
 
@@ -2186,24 +2210,54 @@ Rate limiting and quota enforcement are split into three ownership tiers with st
 - Provider 429 from OAGW is propagated to the domain service, which maps it to `rate_limited` (429) for the client with a meaningful error message.
 - Mid-stream quota abort is NOT supported — quota is checked at preflight only. Mid-stream abort is only triggered by: user cancel, provider error, or infrastructure limits (see `cpt-cf-mini-chat-constraint-quota-before-outbound`).
 
-**Quota counting flow**:
+**Quota counting flow** (bucket model — see `quota_usage` table, section 3.7):
 
 ```text
+fn remaining_credits(bucket, period) -> i64:
+    # remaining_credits accounts for BOTH committed spend AND in-flight reserves
+    # from other concurrent requests, read from quota_usage row for
+    # (tenant_id, user_id, period.type, period.start, bucket):
+    row = quota_usage[tenant_id, user_id, period.type, period.start, bucket]
+    return limit_credits_micro(bucket, period) - row.spent_credits_micro - row.reserved_credits_micro
+
+# limit_credits_micro mapping:
+#   bucket 'total'        -> user_limits.standard.limit_{period}  (overall cap)
+#   bucket 'tier:premium' -> user_limits.premium.limit_{period}   (premium subcap)
+
 fn tier_available(tier, periods) -> bool:
-    return periods.iter().all(|p| remaining_credits(tier, p) > 0)
+    if tier == standard:
+        # standard availability: overall cap only
+        return periods.iter().all(|p| remaining_credits('total', p) > 0)
+    if tier == premium:
+        # premium availability: BOTH overall cap AND premium subcap
+        return periods.iter().all(|p|
+            remaining_credits('total', p) > 0
+            AND remaining_credits('tier:premium', p) > 0)
 
 Preflight (reserve) (before LLM call):
-  estimate_tokens = tokens(ContextPlan) + max_output_tokens
-  reserved_credits = credits(estimate_tokens, model_multipliers)
+  estimated_input_tokens = tokens(ContextPlan) + surcharges   # see section 5.4.1
+  max_output_tokens_applied = max_output_tokens                # persisted on chat_turns
+  reserve_tokens = estimated_input_tokens + max_output_tokens_applied
+  reserved_credits = credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)
   cascade = [premium, standard]  # fixed order
   effective_tier = first tier in cascade where tier_available(tier, [daily, monthly])
   if none -> reject with quota_exceeded (429)
   reserve(effective_tier, reserved_credits)
+  # reserve atomically increments quota_usage.reserved_credits_micro:
+  #   - always: bucket 'total' for all applicable period rows
+  #   - if effective_tier == premium: also bucket 'tier:premium' for all applicable period rows
 
 Commit (after done event):
-  actual = response.usage.input_tokens + response.usage.output_tokens
-  actual_credits = credits(actual, model_multipliers)
-  quota_usage += actual_credits (at the effective tier)
+  actual_credits = credits_micro(usage.input_tokens, usage.output_tokens, in_mult, out_mult)
+  # atomically for each applicable period row:
+  #   bucket 'total':
+  #     reserved_credits_micro -= reserved_credits
+  #     spent_credits_micro += actual_credits
+  #     calls += 1; input_tokens += usage.input_tokens; output_tokens += usage.output_tokens
+  #   if effective_tier == premium, also bucket 'tier:premium':
+  #     reserved_credits_micro -= reserved_credits
+  #     spent_credits_micro += actual_credits
+  #     calls += 1
   (if actual_credits > reserved_credits -> debit overshoot, never cancel completed response)
 ```
 
@@ -2227,7 +2281,7 @@ If all tiers have at least one exhausted period → reject with `quota_exceeded`
 
 The domain service resolves the effective model for each turn before any outbound call to OAGW. The algorithm is deterministic and runs at preflight only; no mid-stream quota abort is performed (see `cpt-cf-mini-chat-constraint-quota-before-outbound`).
 
-**Inputs**: `selected_model` (from request), model catalog, `quota_usage` (daily + monthly per tier), kill switches.
+**Inputs**: `selected_model` (from request), model catalog, `quota_usage` bucket rows (daily + monthly; buckets `total` and `tier:premium`), kill switches.
 
 **Algorithm** (step by step):
 
@@ -2235,7 +2289,7 @@ The domain service resolves the effective model for each turn before any outboun
 2. Build the cascade list in fixed order: `[premium, standard]`.
 3. For each tier in the cascade:
    a. If the tier is disabled by a kill switch, skip.
-   b. Evaluate `tier_available(tier)`: the tier is available only if `remaining_credits(tier, period) > 0` for ALL enabled periods (daily AND monthly).
+   b. Evaluate `tier_available(tier)`: the tier is available only if `remaining_credits(bucket, period) > 0` for ALL required buckets and ALL enabled periods (daily AND monthly). For standard: check bucket `total`. For premium: check buckets `total` AND `tier:premium`.
    c. If available, select a concrete model for that tier:
       - Prefer the model marked `is_default: true` in that tier.
       - If no default, choose the first enabled model in that tier (catalog order).
@@ -2379,7 +2433,7 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_quota_commit_total{period}` (counter)
 - `mini_chat_quota_overshoot_total{period}` (counter; `actual > estimate`)
 - `mini_chat_quota_negative_total{period}` (counter; remaining below 0 or below configured negative threshold)
-- `mini_chat_quota_estimated_tokens` (histogram; `input_estimate + max_output_tokens`)
+- `mini_chat_quota_estimated_tokens` (histogram; `estimated_input_tokens + max_output_tokens_applied` = `reserve_tokens`)
 - `mini_chat_quota_actual_tokens` (histogram; `usage.input_tokens + usage.output_tokens`)
 - `mini_chat_quota_overshoot_tokens` (histogram; `max(actual-estimate,0)`)
 - `mini_chat_quota_reserved_tokens{period}` (gauge; `period`: `daily|monthly`; only if a pending/reserved concept exists)
@@ -2713,10 +2767,10 @@ The overall scheme:
 - A background dispatcher publishes usage events via the selected `minichat-policy-plugin` plugin (`publish_usage(payload)`).
 - CCM consumes usage events and updates the balance.
 
-The user has **a single wallet of credits specifically for chat**. Per-tier limits are nested caps:
+The user has **a single wallet of credits specifically for chat**. Per-tier limits are nested caps, enforced via bucket rows in `quota_usage` (section 3.7):
 
-- standard tier limits act as the overall cap (total spend)
-- premium tier limits act as a premium-only sub-cap
+- standard tier limits map to bucket `total` — the overall cap (total spend across all tiers)
+- premium tier limits map to bucket `tier:premium` — a premium-only sub-cap (premium-tier spend only)
 
 "One wallet for chat" is implemented because snapshot limits are derived from balance, while enforcement is in mini-chat. CCM balance may be eventually consistent, but there is no overspend if limits are computed correctly and there is a hard cap on output.
 
@@ -2754,24 +2808,34 @@ Contents (logically):
 
   - `model_id`
   - `tier` (premium/standard)
-  - `input_tokens_credit_multiplier`
-  - `output_tokens_credit_multiplier`
+  - `input_tokens_credit_multiplier` (micro-credits per 1K tokens; > 0 always)
+  - `output_tokens_credit_multiplier` (micro-credits per 1K tokens; > 0 always)
   - `multiplier_display`
+
+- `estimation_budgets` (fixed surcharge token budgets for preflight reserve estimation):
+
+  - `image_token_budget` (integer; tokens per image for vision surcharge; > 0 always; see section 5.5.5)
+  - `tool_surcharge_tokens` (integer; fixed token overhead when `file_search` tool is included; see section 5.5.6)
+  - `web_search_surcharge_tokens` (integer; fixed token overhead when `web_search` tool is included; see section 5.5.6)
+  - `bytes_per_token_conservative` (integer; conservative bytes-per-token ratio for text estimation; see section 5.5.4; e.g. 3)
+  - `fixed_overhead_tokens` (integer; constant overhead for protocol/framing tokens; see section 5.5.4)
+  - `safety_margin_pct` (integer; percentage safety margin applied to text estimation; see section 5.5.4; e.g. 20 for 20%)
+  - `minimal_generation_floor` (integer; minimum output token charge for streams that reached the provider; used as `charged_output_tokens` in estimated settlement paths; see section 5.8; MUST satisfy `0 < minimal_generation_floor <= max_output_tokens`)
 
 - `user_limits` (per user allocation; delivered/derived per-user, but tied to `policy_version`):
 
   - for each tier:
 
-    - `limit_4h`
+    - `limit_4h` (reserved for P2+; P1 enforcement MUST ignore this field if present)
     - `limit_daily`
     - `limit_monthly`
 
-    These limits are expressed in the same unit: credits.
+    These limits are expressed in the same unit: credits (micro-credits internally). `limit_4h` is included in the snapshot structure for forward compatibility but MUST NOT be enforced by P1 code. P1 enforces only `limit_daily` and `limit_monthly`.
 
-NOTE: the user still has a single wallet of credits. Per-tier limits are nested caps:
+NOTE: the user still has a single wallet of credits. Per-tier limits are nested caps, stored via the bucket model in `quota_usage` (section 3.7):
 
-- standard tier limits act as the overall cap (total spend)
-- premium tier limits act as a premium-only sub-cap
+- standard tier limits map to bucket `total` — the overall cap (total spend across all tiers)
+- premium tier limits map to bucket `tier:premium` — a premium-only sub-cap (premium-tier spend only)
 
 There may also be kill switches, but that's not critical here.
 
@@ -2838,20 +2902,58 @@ We interpret each model multiplier as "credits per 1K tokens", stored as micro-c
 - `input_tokens_credit_multiplier_micro`
 - `output_tokens_credit_multiplier_micro`
 
-Conversion:
+Conversion (canonical formula — all call sites MUST use this exact per-component rounding):
 
 ```
-credits_micro =
-  ceil(input_tokens  * input_tokens_credit_multiplier_micro  / 1000)
-+ ceil(output_tokens * output_tokens_credit_multiplier_micro / 1000)
+fn credits_micro(input_tokens: i64, output_tokens: i64, in_mult: i64, out_mult: i64) -> i64:
+    return ceil_div(input_tokens * in_mult, 1000) + ceil_div(output_tokens * out_mult, 1000)
+
+fn ceil_div(n: i64, d: i64) -> i64:
+    return (n + d - 1) / d
 ```
 
-`ceil(x / 1000)` is implemented as integer math: `(x + 999) / 1000`.
+Where:
+- `input_tokens` — provider-reported or estimated input token count (non-negative integer)
+- `output_tokens` — provider-reported or estimated output token count (non-negative integer)
+- `in_mult` — `input_tokens_credit_multiplier_micro` from the policy snapshot model catalog entry (positive integer, micro-credits per 1K tokens)
+- `out_mult` — `output_tokens_credit_multiplier_micro` from the policy snapshot model catalog entry (positive integer, micro-credits per 1K tokens)
+
+**Rounding rule (normative)**: `ceil_div` is applied **per-component** (input and output separately), NOT to the sum. This ensures deterministic results regardless of the ratio between input and output tokens. `ceil_div(a, 1000) + ceil_div(b, 1000)` may differ from `ceil_div(a + b, 1000)` by up to 1 micro-credit — this is intentional and consistent.
 
 **Note on zero multipliers**: if a model had `input_tokens_credit_multiplier = 0` and `output_tokens_credit_multiplier = 0`, then the system would not debit credits and a credit-based quota would not be consumed, which effectively creates unlimited usage. Therefore, in a credit-based enforcement model:
 
 - `input_tokens_credit_multiplier > 0` always
 - `output_tokens_credit_multiplier > 0` always
+
+#### 5.3.1 Reserve vs Settlement Variables (Canonical Glossary)
+
+All variable names below are normative. All sections in this document MUST use these names when referring to these quantities.
+
+**Preflight (reserve-time) variables** — computed at preflight, persisted on `chat_turns`, immutable after insert:
+
+| Variable | Persisted on | Definition |
+|----------|-------------|------------|
+| `estimated_input_tokens` | derived: `reserve_tokens - max_output_tokens_applied` | Total estimated input tokens (text + image/tool/web_search surcharges). At settlement, re-derived from persisted columns. |
+| `max_output_tokens_applied` | `chat_turns.max_output_tokens_applied` | The `max_output_tokens` value used for this turn. Hard cap sent to the provider. |
+| `reserve_tokens` | `chat_turns.reserve_tokens` | `estimated_input_tokens + max_output_tokens_applied` (token-denominated total). |
+| `reserved_credits_micro` | `chat_turns.reserved_credits_micro` | `credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)` (section 5.3). |
+| `policy_version_applied` | `chat_turns.policy_version_applied` | Monotonic version of the policy snapshot used for this turn. Multipliers and limits are read from this version at settlement. |
+
+**Settlement (commit-time) variables** — computed at finalization:
+
+| Variable | Definition |
+|----------|------------|
+| `actual_input_tokens` | Provider-reported input tokens (`response.usage.input_tokens`). Available only for COMPLETED and some FAILED/ABORTED outcomes. |
+| `actual_output_tokens` | Provider-reported output tokens (`response.usage.output_tokens`). |
+| `actual_credits_micro` | `credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. Authoritative amount debited from `quota_usage` and sent to CCM via outbox. |
+
+**Estimated settlement variables** — used when provider did not report actual usage (ABORTED / FAILED post-provider-start):
+
+| Variable | Definition |
+|----------|------------|
+| `charged_output_tokens` | The output token count charged in estimated settlement. Equals `minimal_generation_floor` (from `estimation_budgets` in the policy snapshot identified by `policy_version_applied`). |
+| `charged_tokens` | `min(reserve_tokens, estimated_input_tokens + charged_output_tokens)` — total token charge (section 5.8). |
+| `actual_credits_micro` (estimated path) | `credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Same field name as the actual path; the settlement_method outbox field distinguishes the two. |
 
 ### 5.4 Quota Enforcement Flow: Reserve → Execute → Settle
 
@@ -2862,7 +2964,7 @@ For each turn, the quota enforcement flow proceeds in five steps:
 1. Resolve current policy snapshot via `minichat-policy-plugin` (section 5.2)
 2. Assemble request context and estimate worst-case usage
 3. Reserve credits and persist `policy_version_applied`
-4. Call provider with `max_output_tokens` hard cap
+4. Call provider with `max_output_tokens_applied` as hard cap
 5. Settle by actual usage and emit outbox usage event
 
 **Success**: Turn is allowed (possibly downgraded tier), executed, and settled by actual usage.
@@ -2883,44 +2985,59 @@ mini-chat selects `effective_model` (with downgrade if needed) based on the curr
 
 Then it computes:
 
-- `estimated_input_tokens` (roughly: text + metadata + retrieved chunks)
+- `estimated_text_tokens` (roughly: text + metadata + retrieved chunks)
 - `image_surcharge_tokens` (if images are present; fixed conservative budget)
 - `tool_surcharge_tokens` (if tools are present; fixed conservative budget)
 - `web_search_surcharge_tokens` (if web_search is enabled; fixed conservative budget)
-- `max_output_tokens` (upper bound for the answer)
-- model credit multipliers (for the chosen model)
+- `max_output_tokens_applied` — the `max_output_tokens` value used for this turn; persisted on `chat_turns.max_output_tokens_applied` (immutable after insert)
+- model credit multipliers (`in_mult`, `out_mult`) for the chosen model from the policy snapshot
 
-Reserve:
+Reserve (canonical formula):
 
 ```
-reserved_input_tokens =
-  estimated_input_tokens
+estimated_input_tokens =
+  estimated_text_tokens
   + image_surcharge_tokens
   + tool_surcharge_tokens
   + web_search_surcharge_tokens
 
-reserved_output_tokens = max_output_tokens
+reserve_tokens = estimated_input_tokens + max_output_tokens_applied
 
 reserved_credits_micro =
-  credits_micro(reserved_input_tokens, reserved_output_tokens, multipliers)
+  credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)
 ```
 
-These are the "quota credits" (credit units used for enforcement).
+Where `credits_micro()` is the canonical function defined in section 5.3 with per-component `ceil_div` rounding.
+
+These are the "quota credits" (credit units used for enforcement). All three values (`estimated_input_tokens`, `max_output_tokens_applied`, `reserve_tokens`) are persisted on `chat_turns` at preflight and are immutable after insert. At settlement time, `estimated_input_tokens` can be re-derived from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`.
 
 #### 5.4.2 Period Enforcement and Tier Downgrade
 
-For the chosen tier (premium or standard), mini-chat checks that the tier is available across **all** periods.
+For the chosen tier (premium or standard), mini-chat checks that the tier is available across **all** periods using the bucket model (see `quota_usage` table, section 3.7).
 
-For each period:
+**Bucket check per period**:
 
 ```
-if spent_credits_micro(period) + reserved_credits_micro > limit_credits_micro(period):
-  tier unavailable
+fn bucket_available(bucket, period, this_request_reserved_credits_micro) -> bool:
+    row = quota_usage[tenant_id, user_id, period.type, period.start, bucket]
+    return row.spent_credits_micro + row.reserved_credits_micro + this_request_reserved_credits_micro
+           <= limit_credits_micro(bucket, period)
 ```
 
-The rule "a tier is available only if the limit exists in all enabled periods" means:
+**Tier availability** (calls `bucket_available` for the required buckets):
 
-- if daily is ok but monthly is not, the tier is unavailable
+- **Standard tier**: available if `bucket_available('total', period, ...)` for ALL enabled periods.
+- **Premium tier**: available if `bucket_available('total', period, ...)` AND `bucket_available('tier:premium', period, ...)` for ALL enabled periods.
+
+Where:
+- `row.spent_credits_micro` — the `quota_usage.spent_credits_micro` value from the bucket row matching `(tenant_id, user_id, period_type, period_start, bucket)`. In bucket `total` this includes credits spent across **all** tiers (overall cap). In bucket `tier:premium` this includes only credits spent on premium-tier turns (subcap).
+- `row.reserved_credits_micro` — the `quota_usage.reserved_credits_micro` value from the same bucket row. Represents the sum of in-flight reserves from other concurrent requests against this bucket.
+- `this_request_reserved_credits_micro` — the `reserved_credits_micro` computed in section 5.4.1 for the current request.
+- `limit_credits_micro(bucket, period)` — the per-user limit from the policy snapshot `user_limits` for the given bucket and period. Mapping: bucket `total` uses `user_limits.standard.limit_{period}` (overall cap); bucket `tier:premium` uses `user_limits.premium.limit_{period}` (premium subcap). Read-only at enforcement time; derived by CCM.
+
+The rule "a tier is available only if all buckets pass in all enabled periods" means:
+
+- if daily is ok but monthly is not for any required bucket, the tier is unavailable
 
 In P1, the enabled periods are:
 
@@ -2938,15 +3055,21 @@ If no tier is available — return 429 `quota_exceeded`.
 If allowed, mini-chat performs a local transaction:
 
 - creates a `chat_turn` in `running` state
-- stores:
+- persists on the `chat_turns` row (all immutable after insert):
 
   - `request_id`
-  - `policy_version_applied`
-  - `effective_model`
-  - `reserved_credits_micro`
-  - "period keys" (e.g. which bucket for day/month)
+  - `policy_version_applied` (from the current policy snapshot)
+  - `effective_model` (resolved via downgrade cascade)
+  - `reserve_tokens` (`estimated_input_tokens + max_output_tokens_applied`, token-denominated)
+  - `max_output_tokens_applied` (the `max_output_tokens` value used for this turn; immutable after insert)
+  - `reserved_credits_micro` = `credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)` (credit-denominated reserve; section 5.3)
 
-- increments local "reserved" counters for the periods (or "held") so parallel requests cannot slip through
+- atomically increments `quota_usage.reserved_credits_micro` for the correct bucket rows:
+  - Always: bucket `total` for all applicable period rows `(tenant_id, user_id, period_type, period_start, 'total')`
+  - If effective tier is premium: also bucket `tier:premium` for all applicable period rows `(tenant_id, user_id, period_type, period_start, 'tier:premium')`
+  - Standard-tier turns update bucket `total` only
+
+  (see section 3.7 `quota_usage` commit semantics)
 
 Only after that it calls the LLM.
 
@@ -3002,10 +3125,10 @@ If usage is unavailable (e.g., orphan/disconnect and no terminal usage), the pol
 Then mini-chat performs atomically, in a single transaction (CAS on `chat_turn.state` — see section 5.7 for the normative finalization contract):
 
 1. CAS on `chat_turn.state` (first terminal wins)
-2. update period counters:
+2. update bucket rows for each applicable period:
 
-  - `spent += actual_credits_micro`
-  - `reserved -= reserved_credits_micro` (if you keep reserved separately)
+   - **Always (bucket `total`)**: `spent_credits_micro += actual_credits_micro; reserved_credits_micro -= reserved_credits_micro; calls += 1; input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`
+   - **If turn ran on premium tier (bucket `tier:premium`)**: `spent_credits_micro += actual_credits_micro; reserved_credits_micro -= reserved_credits_micro; calls += 1`
 
 3. write a usage event into the outbox with fields:
 
@@ -3048,12 +3171,12 @@ In the normal scheme you should not exceed limits, because:
 
 3. **Orphan turn**: if you do not know how much was spent, you either debit `reserved_credits_micro` (conservative), or implement provider-specific handling. This is a policy decision.
 
-**Important rule about periods**:
+**Important rule about periods and buckets**:
 
 - day and month are counted on the same credits scale
-- a tier is available only if all periods are available
-- on reserve you apply `reserved_credits_micro` across all periods at once
-- on commit you convert reserved → spent based on actual
+- a tier is available only if all required buckets pass in all periods (section 5.4.2)
+- on reserve you apply `reserved_credits_micro` to bucket `total` (always) and bucket `tier:premium` (if premium) across all periods at once
+- on commit you convert reserved → spent based on actual for the same bucket rows
 
 #### 5.4.6 No-Overspend Rationale
 
@@ -3107,12 +3230,12 @@ Before calling the LLM, mini-chat:
   - user message
   - metadata/tool wiring
 
-2. Estimates input tokens.
+2. Estimates input tokens (`estimated_text_tokens`).
 3. Adds budget for:
 
-  - max_output_tokens
-  - images
-  - tools / web_search
+  - `max_output_tokens_applied`
+  - images (surcharge)
+  - tools / web_search (surcharges)
 
 4. Computes `reserved_credits_micro`.
 5. Checks limits across all periods.
@@ -3146,11 +3269,11 @@ estimated_text_tokens =
   + safety_margin
 ```
 
-Where:
+Where (all values from `estimation_budgets` in the policy snapshot, section 5.2.1):
 
-- `BYTES_PER_TOKEN_CONSERVATIVE` = 3 (or an even more conservative value)
-- `fixed_overhead_tokens` — a constant from the policy snapshot
-- `safety_margin` = 10–30%
+- `BYTES_PER_TOKEN_CONSERVATIVE` — `estimation_budgets.bytes_per_token_conservative` (integer; e.g. 3). Policy-snapshot-versioned.
+- `fixed_overhead_tokens` — `estimation_budgets.fixed_overhead_tokens` (integer). Policy-snapshot-versioned.
+- `safety_margin` — `estimation_budgets.safety_margin_pct / 100` (integer percentage; e.g. 20 → 0.20). Applied as: `estimated_text_tokens = ceil(base_estimate * (1 + safety_margin_pct / 100))`. Policy-snapshot-versioned.
 
 Underestimation is unacceptable.
 Overestimation is acceptable.
@@ -3169,7 +3292,7 @@ In P1 we use a fixed surcharge:
 image_surcharge_tokens = num_images * image_token_budget
 ```
 
-`image_token_budget` is defined in the policy snapshot and must be conservative (e.g., p95/p99 of historical usage).
+`image_token_budget` — `estimation_budgets.image_token_budget` from the policy snapshot (section 5.2.1). Policy-snapshot-versioned. Must be conservative (e.g., p95/p99 of historical usage).
 
 Important:
 
@@ -3192,41 +3315,45 @@ or
 web_search_surcharge_tokens = ...
 ```
 
-Values are defined in the policy snapshot.
+Where:
+- `tool_surcharge_tokens` — `estimation_budgets.tool_surcharge_tokens` from the policy snapshot (section 5.2.1). Policy-snapshot-versioned.
+- `web_search_surcharge_tokens` — `estimation_budgets.web_search_surcharge_tokens` from the policy snapshot (section 5.2.1). Policy-snapshot-versioned.
 
 #### 5.5.7 Reserved Credits Calculation
 
-After estimation:
+After estimation (canonical form — identical to section 5.4.1):
 
 ```
-reserved_input_tokens =
-  estimated_input_tokens + image_surcharge_tokens + tool_surcharge_tokens + web_search_surcharge_tokens
+estimated_input_tokens =
+  estimated_text_tokens + image_surcharge_tokens + tool_surcharge_tokens + web_search_surcharge_tokens
 
-reserved_output_tokens = max_output_tokens
+reserve_tokens = estimated_input_tokens + max_output_tokens_applied
 
 reserved_credits_micro =
-  credits_micro(reserved_input_tokens, reserved_output_tokens, multipliers)
+  credits_micro(estimated_input_tokens, max_output_tokens_applied, in_mult, out_mult)
 ```
 
 Where:
 
-- `input_tokens_credit_multiplier` > 0 (always)
-- `output_tokens_credit_multiplier` > 0 (always)
+- `in_mult` = `input_tokens_credit_multiplier` > 0 (always)
+- `out_mult` = `output_tokens_credit_multiplier` > 0 (always)
+- `max_output_tokens_applied` = the `max_output_tokens` value persisted on `chat_turns` for this turn
 
 #### 5.5.8 Limit Checks and max_output_tokens
 
-A tier is considered available only if:
+A tier is considered available only if, for each required bucket, the following holds:
 
 ```
-spent_credits_micro(period) + reserved_credits_micro <= limit_credits_micro(period)
+quota_usage[bucket].spent_credits_micro + quota_usage[bucket].reserved_credits_micro + this_request_reserved_credits_micro
+    <= limit_credits_micro(bucket, period)
 ```
 
-for all enabled periods (P1):
+for all enabled periods (P1: daily, monthly) and all required buckets:
 
-- daily
-- monthly
+- **Standard tier**: bucket `total`
+- **Premium tier**: buckets `total` AND `tier:premium`
 
-Reserve is applied to all periods.
+Reserve is applied to the correct bucket rows across all periods (section 5.4.3).
 
 `max_output_tokens` must be set as a hard cap in the provider request. This guarantees:
 
@@ -3244,10 +3371,10 @@ actual_credits_micro =
 
 In P1, image/tool actual is typically not recomputed separately: the source of truth for `actual_input_tokens` / `actual_output_tokens` is provider usage (as the provider counts it).
 
-Settlement:
+Settlement (per bucket row — see section 5.4.4):
 
-- reserved is released
-- actual is charged
+- reserved is released from the correct bucket rows (bucket `total` always; bucket `tier:premium` if premium turn)
+- actual is charged to the same bucket rows
 - the difference is returned to available limits
 
 #### 5.5.10 Policy Versioning
@@ -3310,7 +3437,7 @@ Mini-Chat usage events use:
 
 **Conflict semantics (normative)**: the outbox INSERT MUST use `INSERT ... ON CONFLICT (namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING` (or the equivalent ORM upsert-ignore). If the INSERT returns zero rows affected (dedupe conflict), the finalizer MUST treat the event as already emitted and MUST NOT re-emit. The finalizer MUST NOT raise an error to the caller on dedupe conflict — the duplicate is a normal idempotency outcome, not an error condition.
 
-**Transactional rule**: the quota usage commit (updating `quota_usage` rows) and the outbox row insert MUST happen in the same database transaction. If either fails, the entire transaction rolls back. This guarantees that every committed quota change has a corresponding pending event.
+**Transactional rule**: the quota usage commit (updating `quota_usage` bucket rows) and the outbox row insert MUST happen in the same database transaction. If either fails, the entire transaction rolls back. This guarantees that every committed quota change has a corresponding pending event.
 
 **Dispatcher worker**: a background dispatcher (ModKit `stateful` lifecycle task) polls `modkit_outbox_events` rows where `status = 'pending'` and `next_attempt_at <= now()`, filtered by `namespace = 'mini-chat'`, ordered by `created_at`. For each row:
 
@@ -3496,14 +3623,19 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 **1) completed** (normal `done`):
 
 - Settle using actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`).
-- Release unused reserve, commit actual usage to `quota_usage`.
+- Release unused reserve, commit actual usage to `quota_usage` bucket rows (bucket `total` always; bucket `tier:premium` if premium turn).
 - If actual exceeds estimate (overshoot), commit the overshoot; never retroactively cancel a completed response.
 - Emit outbox event: `event_type = 'usage_finalized'`, `payload_json` MUST include:
   - `outcome`: `"completed"`
   - `settlement_method`: `"actual"`
   - `effective_model`, `selected_model`, `quota_decision` (and `downgrade_from`, `downgrade_reason` if present)
-  - `usage`: `{ input_tokens, output_tokens }`
+  - `policy_version_applied` (from `chat_turns.policy_version_applied`)
+  - `usage`: `{ input_tokens, output_tokens }` (token-denominated; provider-reported actuals; telemetry)
+  - `actual_credits_micro` (credit-denominated; **authoritative for CCM billing debit**; computed via `credits_micro()` formula in section 5.3 using the model multipliers from the policy snapshot identified by `policy_version_applied`)
+  - `reserved_credits_micro` (credit-denominated; the preflight reserve from `chat_turns.reserved_credits_micro`; informational for delta/reconciliation)
   - `turn_id`, `request_id`, `chat_id`, `tenant_id`, `user_id`
+
+**Outbox payload unit convention (normative for all outcomes)**: every usage outbox event MUST include both `usage` (token-denominated, for telemetry and cost reporting) and `actual_credits_micro` (credit-denominated, authoritative for CCM debit). CCM MUST use `actual_credits_micro` as the amount to debit from the user's chat wallet. CCM MUST NOT independently recompute credits from token counts — `actual_credits_micro` is the source of truth.
 
 **2) failed** (terminal error):
 
@@ -3537,7 +3669,7 @@ When a provider request is issued (after preflight passes and before the first o
 |-------|-------|
 | `turn_id` | Internal turn identifier (`chat_turns.id`) |
 | `request_id` | Client-generated idempotency key |
-| `reserve_tokens` | Preflight reserve amount (`estimated_input_tokens + max_output_tokens`) |
+| `reserve_tokens` | Preflight reserve amount (`estimated_input_tokens + max_output_tokens_applied`) |
 | `state` | `IN_PROGRESS` (maps to `chat_turns.state = running`) |
 
 `reserve_tokens` MUST be persisted on the `chat_turns` row (see `cpt-cf-mini-chat-dbtable-chat-turns`) at the time the reserve is taken. This value is required for deterministic reconciliation if the stream does not complete normally (see reserve persistence prerequisite, section 5.7).
@@ -3571,11 +3703,23 @@ charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation
 ```
 
 Where:
-- `reserve_tokens` — the persisted preflight reserve from the `chat_turns` row.
-- `estimated_input_tokens` — token estimate of the `ContextPlan` that was sent to the provider (derived from `reserve_tokens - max_output_tokens` using the deployment-configured `max_output_tokens`).
-- `minimal_generation_floor` — a configurable constant representing the minimum output token charge for any stream that reached the provider (default: 50 tokens). This prevents zero-charge exploitation via immediate disconnect after the provider begins processing. Configuration constraints: `minimal_generation_floor` MUST be explicitly set in deployment configuration (no implicit default without operator acknowledgment), MUST satisfy `0 < minimal_generation_floor <= max_output_tokens`, and MUST be validated at startup. A value exceeding `max_output_tokens` MUST be rejected as invalid configuration.
+- `reserve_tokens` — persisted on `chat_turns.reserve_tokens` (BIGINT, immutable after insert). Set at preflight. Read from the DB row at settlement time (not from in-memory state).
+- `estimated_input_tokens` — derived deterministically from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`. Both values are immutable after insert and available on the `chat_turns` row. The derivation MUST NOT use deployment config values that may have changed since preflight.
+- `minimal_generation_floor` — a configurable constant representing the minimum output token charge for any stream that reached the provider (default: 50 tokens). This prevents zero-charge exploitation via immediate disconnect after the provider begins processing. **Configuration source**: this value is part of the policy snapshot `estimation_budgets.minimal_generation_floor` (section 5.2.1). The value applied for a given turn is determined by `chat_turns.policy_version_applied`, ensuring determinism even if the policy changes between turn start and settlement. Configuration constraints: `minimal_generation_floor` MUST satisfy `0 < minimal_generation_floor <= max_output_tokens` (deployment-configured hard cap), and MUST be validated at snapshot load time. A value exceeding `max_output_tokens` MUST be rejected as invalid configuration.
 
-If the provider DID report partial usage before the stream ended (e.g., usage metadata on a partial response), the system MUST prefer actual usage over the formula: `charged_tokens = actual_input_tokens + actual_output_tokens`.
+**Credit conversion** (estimated path): when no actual usage is available, define `charged_output_tokens = minimal_generation_floor`. The credit conversion is:
+
+```text
+actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)
+```
+
+where `in_mult` and `out_mult` come from the model catalog entry for `chat_turns.effective_model` within the policy snapshot identified by `chat_turns.policy_version_applied`. The system MUST NOT use the current (latest) policy snapshot for settlement of older turns.
+
+**Credit conversion** (actual path): if the provider DID report partial usage before the stream ended (e.g., usage metadata on a partial response), the system MUST prefer actual usage. In this case `charged_output_tokens = actual_output_tokens` and:
+
+```text
+actual_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)
+```
 
 The formula is deliberately conservative (charges less than or equal to the reserve) to avoid overcharging users for incomplete work, while the `minimal_generation_floor` ensures non-zero billing for provider resources consumed.
 
@@ -3588,10 +3732,14 @@ When a turn transitions to `ABORTED`, the system MUST emit a `modkit_outbox_even
 | `event_type` | `usage_finalized` |
 | `outcome` | `"aborted"` |
 | `settlement_method` | `"estimated"` (or `"actual"` if provider reported partial usage) |
-| `charged_tokens` | Result of the deterministic formula above |
-| `reserve_tokens` | Original preflight reserve |
-| `effective_model` | Model resolved at preflight |
+| `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
+| `actual_credits_micro` | Credit-denominated charge (authoritative for CCM billing debit; see section 5.7 outbox payload unit convention) |
+| `reserved_credits_micro` | Original preflight credit reserve from `chat_turns.reserved_credits_micro` |
+| `reserve_tokens` | Original preflight token reserve from `chat_turns.reserve_tokens` |
+| `policy_version_applied` | From `chat_turns.policy_version_applied` |
+| `effective_model` | Model resolved at preflight (from `chat_turns.effective_model`) |
 | `selected_model` | Model from `chats.model` |
+| `error_code` | Terminal error code from `chat_turns.error_code` (nullable; e.g. `"orphan_timeout"`, `"client_disconnect"`) |
 | `quota_decision`, `downgrade_from`, `downgrade_reason` | If applicable |
 | `turn_id`, `request_id`, `chat_id`, `tenant_id`, `user_id` | Standard identifiers |
 
@@ -3677,8 +3825,10 @@ When the provider issues a terminal `event: error` after streaming has started, 
    ```
    Where:
    - `reserve_tokens` — the persisted preflight reserve from the `chat_turns` row.
-   - `estimated_input_tokens` — token estimate of the `ContextPlan` sent to the provider (derived from `reserve_tokens - max_output_tokens` using the deployment-configured `max_output_tokens`).
+   - `estimated_input_tokens` — token estimate of the `ContextPlan` sent to the provider (derived deterministically from persisted columns: `chat_turns.reserve_tokens - chat_turns.max_output_tokens_applied`).
    - `minimal_generation_floor` — the same configurable constant used in the ABORTED formula (section 5.8, default: 50 tokens).
+
+**Credit conversion**: identical to section 5.8. For case 1 (actual): `actual_credits_micro = credits_micro(actual_input_tokens, actual_output_tokens, in_mult, out_mult)`. For case 2 (estimated): `charged_output_tokens = minimal_generation_floor` and `actual_credits_micro = credits_micro(estimated_input_tokens, charged_output_tokens, in_mult, out_mult)`. Multipliers come from the policy snapshot identified by `chat_turns.policy_version_applied`.
 
 **Critical constraint**: the system MUST NEVER charge the full `reserve_tokens` unless the provider explicitly reports usage equal to or exceeding the reserve. When no provider usage is available, the charge is bounded by the estimated input cost plus `minimal_generation_floor`, reflecting that the provider received the prompt and may have consumed resources before the error.
 
@@ -3702,12 +3852,14 @@ When a post-stream terminal error is finalized, the system MUST emit a `modkit_o
 |-------|-------|
 | `event_type` | `usage_finalized` |
 | `outcome` | `"failed"` |
-| `status` | `"failed"` |
 | `settlement_method` | `"actual"` if provider reported usage; `"estimated"` otherwise |
-| `charged_tokens` | Result of the reconciliation rule above |
-| `reserve_tokens` | Original preflight reserve |
-| `error_code` | Provider or internal error code (e.g., `provider_error`, `provider_timeout`) |
-| `effective_model` | Model resolved at preflight |
+| `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
+| `actual_credits_micro` | Credit-denominated charge (authoritative for CCM billing debit; see section 5.7 outbox payload unit convention) |
+| `reserved_credits_micro` | Original preflight credit reserve from `chat_turns.reserved_credits_micro` |
+| `reserve_tokens` | Original preflight token reserve from `chat_turns.reserve_tokens` |
+| `policy_version_applied` | From `chat_turns.policy_version_applied` |
+| `error_code` | Provider or internal error code from `chat_turns.error_code` (e.g., `provider_error`, `provider_timeout`, `orphan_timeout`) |
+| `effective_model` | Model resolved at preflight (from `chat_turns.effective_model`) |
 | `selected_model` | Model from `chats.model` |
 | `quota_decision`, `downgrade_from`, `downgrade_reason` | If applicable |
 | `turn_id`, `request_id`, `chat_id`, `tenant_id`, `user_id` | Standard identifiers |
@@ -3766,31 +3918,31 @@ For simplicity, assume input and output multipliers are equal and expressed as *
 - **Premium model P**: `input_tokens_credit_multiplier_micro = 2_500_000`, `output_tokens_credit_multiplier_micro = 2_500_000` (2.5 credits per 1K tokens)
 - **Standard model S**: `input_tokens_credit_multiplier_micro = 1_000_000`, `output_tokens_credit_multiplier_micro = 1_000_000` (1.0 credits per 1K tokens)
 
-**User limits (in `credits_micro`)**
+**User limits (in `credits_micro`)** — mapped to buckets per section 5.4.2:
 
 For simplicity, limits are given directly in `credits_micro` (micro-credits).
 
-Premium tier limits:
+Bucket `tier:premium` limits (`user_limits.premium`):
 
 - day: 22_000_000
 - month: 300_000_000
 
-Standard tier limits:
+Bucket `total` limits (`user_limits.standard` — overall cap):
 
 - day: 60_000_000
 - month: 600_000_000
 
-**User consumption before the new request** (already "spent credits")
+**User consumption before the new request** (`quota_usage` bucket rows, `spent_credits_micro`)
 
-Premium spent:
+Bucket `tier:premium`:
 
 - day: 20_000_000
 - month: 200_000_000
 
-Standard spent:
+Bucket `total` (includes all tiers):
 
-- day: 5_000_000
-- month: 40_000_000
+- day: 25_000_000 (= 20M premium + 5M standard)
+- month: 240_000_000 (= 200M premium + 40M standard)
 
 **User request (turn)**
 
@@ -3806,43 +3958,53 @@ Worst-case tokens for reserve:
 
 **Reserve calculation**
 
+**Note**: this example uses equal input/output multipliers (`in_mult == out_mult`) and token counts that divide evenly by 1000, so the per-component `ceil_div` rounding (section 5.3) has no effect. In production, the canonical `credits_micro(input_tokens, output_tokens, in_mult, out_mult)` function MUST be used with per-component rounding. The simplified form `total_tokens * mult / 1000` shown below is valid only when multipliers are equal and the products are exact multiples of 1000.
+
 ```
-reserved_credits_micro_premium = 1,500 * 2_500_000 / 1000 = 3_750_000
+reserved_credits_micro_premium =
+  ceil_div(1_000 * 2_500_000, 1000) + ceil_div(500 * 2_500_000, 1000)
+  = 2_500_000 + 1_250_000 = 3_750_000
 ```
 
-**Tier availability check across all periods**
+**Tier availability check across all periods and buckets**
 
-We need, for each period:
-`spent + reserved <= limit`
+Premium tier requires BOTH bucket `tier:premium` AND bucket `total` to pass for ALL periods:
 
+Bucket `tier:premium`:
 **day:** 20_000_000 + 3_750_000 = 23_750_000 > 22_000_000  -> does NOT pass
 **month:** 200_000_000 + 3_750_000 = 203_750_000 <= 300_000_000 -> passes
 
-The rule "a tier is available only if ALL periods pass" means:
+(Bucket `total` not checked — `tier:premium` already failed.)
 
-- Premium tier is unavailable due to a tier-specific limit (e.g. premium daily/monthly), so mini-chat downgrades.
+The rule "a tier is available only if ALL required buckets pass in ALL periods" means:
+
+- Premium tier is unavailable (bucket `tier:premium` daily limit exceeded), so mini-chat downgrades.
 
 #### 5.10.3 Step 2 — Downgrade to Standard
 
 **Reserve calculation**
 
 ```
-reserved_credits_micro_standard = 1,500 * 1_000_000 / 1000 = 1_500_000
+reserved_credits_micro_standard =
+  ceil_div(1_000 * 1_000_000, 1000) + ceil_div(500 * 1_000_000, 1000)
+  = 1_000_000 + 500_000 = 1_500_000
 ```
 
-**Period check for standard tier**
+**Bucket check for standard tier** (requires only bucket `total`)
 
-**day:** 5_000_000 + 1_500_000 = 6_500_000 <= 60_000_000 -> passes
-**month:** 40_000_000 + 1_500_000 = 41_500_000 <= 600_000_000 -> passes
+Bucket `total`:
+**day:** 25_000_000 + 1_500_000 = 26_500_000 <= 60_000_000 -> passes
+**month:** 240_000_000 + 1_500_000 = 241_500_000 <= 600_000_000 -> passes
 
-All periods pass -> Standard tier is available.
+All periods pass for bucket `total` -> Standard tier is available.
 
 **What we write to DB at preflight (reserve)**
 
 - `effective_model = Standard`
 - `reserved_credits_micro = 1_500_000`
 - turn state = running
-- local "hold/reserved" counters incremented by 1_500_000 for day/month buckets of the standard tier
+- `quota_usage` bucket `total`: `reserved_credits_micro += 1_500_000` for day and month rows
+- (No `tier:premium` bucket update — this is a standard-tier turn)
 
 After that we call the LLM.
 
@@ -3862,40 +4024,35 @@ Standard multipliers => 1.0 credit per 1K tokens:
 actual_credits_micro = 1,200 * 1_000_000 / 1000 = 1_200_000
 ```
 
-**Settlement: what happens to counters**
+**Settlement: what happens to bucket rows**
 
-You usually have two accounting approaches:
+Before commit (after reserve), bucket `total` rows:
 
-- either `spent` plus separate `reserved`
-- or you immediately increment spent at preflight and then correct
-  More correct and clearer: keep `reserved` separately.
+- reserved_credits_micro(day/month) += 1_500_000
+- spent_credits_micro not changed yet
 
-Before commit (after reserve):
+On commit (bucket `total` only — standard-tier turn):
 
-Standard:
-
-- reserved(day/month) += 1_500_000
-- spent not changed yet (or changed, but logically this is a hold)
-
-On commit:
-
-- decrease reserved by 1_500_000
-- increase spent by 1_200_000
+- `reserved_credits_micro -= 1_500_000`
+- `spent_credits_micro += 1_200_000`
+- `calls += 1; input_tokens += 900; output_tokens += 300`
 - the difference (300_000) is "unfrozen" and returned to the available limit
+
+No changes to bucket `tier:premium` — this turn was standard-tier.
 
 #### 5.10.5 Final Numbers After Commit
 
-Standard spent was:
+Bucket `total` `spent_credits_micro` was:
 
-- day: 5_000_000
-- month: 40_000_000
+- day: 25_000_000
+- month: 240_000_000
 
 After commit (+1_200_000):
 
-- day: 6_200_000
-- month: 41_200_000
+- day: 26_200_000
+- month: 241_200_000
 
-Premium spent did not change because we did not use the premium tier.
+Bucket `tier:premium` `spent_credits_micro` did not change because we did not use the premium tier.
 
 **What if output were maximum**
 
@@ -3907,10 +4064,10 @@ If the model returned `max_output_tokens` and total was 1,500 tokens:
 
 **Why this scheme prevents overspend**
 
-1. Reserve checks all periods before calling the LLM.
+1. Reserve checks all required buckets and all periods before calling the LLM.
 2. Reserve uses worst-case (input estimate + max_output cap).
 3. Output is actually limited by the hard cap.
-4. Commit corrects to actual and returns the extra.
+4. Commit corrects to actual and returns the extra to the correct bucket rows.
 
 ### 5.11 Definitions of Done
 
@@ -3927,7 +4084,7 @@ The system **MUST** persist `policy_version_applied` on `chat_turn` and include 
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-dod-preflight-reserve-and-downgrade`
 
-The system **MUST** reserve worst-case credits before calling the provider, enforce daily/monthly limits locally, and downgrade from premium to standard when premium is unavailable.
+The system **MUST** reserve worst-case credits (in the correct `quota_usage` bucket rows) before calling the provider, enforce daily/monthly limits per bucket locally, and downgrade from premium to standard when premium is unavailable.
 
 **Implements**:
 - `cpt-cf-mini-chat-flow-quota-enforced-chat-turn`
@@ -3943,13 +4100,14 @@ The system **MUST** finalize turns using CAS on `chat_turn.state` and MUST emit 
 
 ### 5.12 Acceptance Criteria (Quota and Billing)
 
-- [ ] If premium tier is exhausted in any period, the system downgrades to standard (if available) before calling the provider.
+- [ ] If premium tier is exhausted in any period or bucket, the system downgrades to standard (if available) before calling the provider.
 - [ ] If no tier is available, the system rejects at preflight with `quota_exceeded` and does not call the provider.
 - [ ] The system persists `policy_version_applied` per turn and uses the same version for settlement and outbox emission.
 - [ ] The system enforces a hard cap on `max_output_tokens` to prevent overshoot beyond reserved worst-case.
 - [ ] Replaying a completed turn for the same `(chat_id, request_id)` MUST NOT take a new quota reserve, debit credits, or emit a new outbox row (replay is side-effect-free).
 - [ ] The orphan watchdog MUST finalize turns stuck in `running` state beyond the configured timeout using the same CAS guard, quota settlement, and outbox emission as all other finalization paths (P1 mandatory).
 - [ ] For any committed quota debit, there MUST exist exactly one corresponding `modkit_outbox_events` row (written in the same DB transaction as the settlement).
+- [ ] Quota enforcement uses `quota_usage` bucket rows: `total` for overall cap, `tier:premium` for premium subcap. Standard-tier availability checks only bucket `total`; premium-tier checks both.
 
 ### 5.13 Deferred to P2+
 
