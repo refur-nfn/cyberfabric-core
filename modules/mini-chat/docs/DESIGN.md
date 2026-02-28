@@ -3497,7 +3497,7 @@ fn bucket_available(bucket, period, this_request_reserved_credits_micro) -> bool
 > Where:
 >
 > * `period.type` — one of the enabled period types: `"daily"` or `"monthly"` (maps to `quota_usage.period_type` column, VARCHAR)
-> * `period.start` — UTC-truncated period boundary timestamp (for daily: UTC day start 00:00:00; for monthly: UTC month start, day 1, 00:00:00). Maps to `quota_usage.period_start` column (TIMESTAMPTZ). Immutable for a given period row.
+> * `period.start` — UTC-truncated period boundary timestamp (for daily: UTC day start 00:00:00; for monthly: UTC month start, day 1, 00:00:00). Maps to `quota_usage.period_start` column (DATE). Note: DATE type stores calendar dates without time-of-day; period boundaries are conceptually midnight UTC but stored as DATE for efficient period-key indexing and to avoid timezone-related bugs. Immutable for a given period row.
 > * `row = quota_usage[...]` — denotes a SELECT query: `SELECT * FROM quota_usage WHERE tenant_id = :tenant_id AND user_id = :user_id AND period_type = :period_type AND period_start = :period_start AND bucket = :bucket`. If no row exists, treat as `spent_credits_micro = 0`, `reserved_credits_micro = 0`.
 
 **Tier availability** (calls `bucket_available` for the required buckets):
@@ -3646,7 +3646,7 @@ In the normal scheme you should not exceed limits, because:
 
    When a COMPLETED turn reports actual usage that exceeds the reserve, the system MUST apply the following bounded overshoot reconciliation:
 
-   ```
+   ```pseudocode
    IF actual_tokens > reserve_tokens AND outcome = COMPLETED:
        // Compute overshoot factor
        overshoot_factor = actual_tokens / reserve_tokens
@@ -3661,11 +3661,17 @@ In the normal scheme you should not exceed limits, because:
            mini_chat_quota_overshoot_tokens.observe(actual_tokens - reserve_tokens)
            mini_chat_quota_overshoot_total{period}.inc()
        ELSE:
-           // Overshoot exceeds tolerance: treat as system error
-           // Finalize as FAILED with error_code='quota_overshoot_exceeded'
-           // Commit: reserve_tokens (cap at reserve; do not allow unbounded overshoot)
+           // Overshoot exceeds tolerance: cap billing at reserve
+           // CRITICAL: Keep turn as COMPLETED (never retroactively cancel completed response)
+           // Billing is capped; response remains delivered to user
            committed_tokens = reserve_tokens
            committed_credits_micro = reserved_credits_micro
+
+           // Log severe overshoot for operator investigation
+           mini_chat_quota_overshoot_exceeded_total.inc()
+           log.error("Overshoot exceeded tolerance", {
+               turn_id, actual_tokens, reserve_tokens, overshoot_factor
+           })
    ```
 
    **Configuration (P1)**:
@@ -3675,7 +3681,11 @@ In the normal scheme you should not exceed limits, because:
 
    **P1 constraint**: `max_output_tokens` is a hard cap sent to the provider, so output token overshoot should not occur under normal operation. Overshoot typically occurs on the input side due to underestimation of multimodal surcharges (images, tools, web_search) or retrieved context. Operators SHOULD tune estimation budgets (section 5.5) to minimize overshoot occurrences.
 
-   **Monitoring**: If `mini_chat_quota_overshoot_total` exceeds 5% of completed turns, operators SHOULD review estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, safety_margin_pct) and consider increasing conservative margins.
+   **Monitoring**:
+   - If `mini_chat_quota_overshoot_total` exceeds 5% of completed turns, operators SHOULD review estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, safety_margin_pct) and consider increasing conservative margins.
+   - If `mini_chat_quota_overshoot_exceeded_total` fires (overshoot > tolerance), this indicates a severe estimation failure requiring immediate investigation. The response was delivered to the user but billing was capped at reserve to prevent unbounded quota drift.
+
+   **Invariant (P1 normative)**: A COMPLETED turn MUST remain COMPLETED regardless of overshoot magnitude. The "never retroactively cancel a completed response" principle is absolute. Overshoot beyond tolerance caps billing at reserve_tokens, logs the anomaly, but does NOT change turn state to FAILED or prevent response delivery.
 
 2. **Policy changes mid-turn**: not a problem because the turn records `policy_version_applied`. It is computed under that version.
 
@@ -3865,7 +3875,7 @@ Where:
 
 A tier is considered available only if, for each required bucket, the following holds:
 
-```
+```text
 quota_usage[bucket].spent_credits_micro + quota_usage[bucket].reserved_credits_micro + this_request_reserved_credits_micro
     <= limit_credits_micro(bucket, period)
 ```
@@ -4034,7 +4044,7 @@ Mini-Chat usage events use:
 
 > Where:
 >
-> * `tenant_id` — persisted UUID from `chat_turns.tenant_id`, normalized to 32-char lowercase hex (strip hyphens)
+> * `tenant_id` — resolved UUID from parent chat's tenant_id (chats.tenant_id via chat_turns.chat_id FK relationship), normalized to 32-char lowercase hex (strip hyphens)
 > * `turn_id` — persisted UUID from `chat_turns.id`, normalized to 32-char lowercase hex (strip hyphens)
 > * `request_id` — persisted UUID from `chat_turns.request_id` (client-provided UUID v4 or server-generated UUID v4), normalized to 32-char lowercase hex (strip hyphens)
 - `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `event_type`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
@@ -4063,7 +4073,7 @@ Mini-Chat usage events use:
 > Where:
 >
 > * `configured max` — maximum retry attempts before dead-lettering. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_attempts` (integer). Default value: `10`. MUST be validated at startup: `3 <= max_attempts <= 100`.
-> * **Permanent failure classification (P1)**: `attempts > max_attempts` (retry exhaustion). Additional permanent error codes (e.g., HTTP 4xx indicating client error, explicit plugin rejection) MAY be added in future revisions but are not required in P1. When `status = 'dead'`, emit metric `mini_chat_outbox_dead_letter_total` (counter, labels: `{namespace, topic}`).
+> * **Permanent failure classification (P1)**: `attempts > max_attempts` (retry exhaustion). Additional permanent error codes (e.g., HTTP 4xx indicating client error, explicit plugin rejection) MAY be added in future revisions but are not required in P1. When `status = 'dead'`, emit metric `mini_chat_outbox_dead_total` (counter, labels: `{namespace, topic}`).
 
 #### Outbox Dispatcher Concurrency and Row Claiming (P1)
 
@@ -4136,8 +4146,8 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
 **Operational guidance (P1 minimum)**:
 
-- Dispatchers MUST use bounded retries: after `max_attempts` (configurable, default: 10) consecutive failures, set `status = 'dead'` and emit the `mini_chat_outbox_failed_total` alert metric.
-- Dispatchers MUST expose observability counters: `mini_chat_outbox_claimed_total`, `mini_chat_outbox_sent_total`, `mini_chat_outbox_failed_total`, `mini_chat_outbox_lease_expired_total`.
+- Dispatchers MUST use bounded retries: after `max_attempts` (configurable, default: 10) consecutive failures, set `status = 'dead'` and emit the `mini_chat_outbox_dead_total` alert metric.
+- Dispatchers MUST expose observability counters: `mini_chat_outbox_claimed_total`, `mini_chat_outbox_sent_total`, `mini_chat_outbox_dead_total`, `mini_chat_outbox_lease_expired_total`.
 - Batch size, retry base delay, max delay, and lease duration are deployment-configurable. Specific default values are deferred to P2+ operational runbooks.
 
 **Idempotency rule**: consumers (CyberChatManager) MUST deduplicate events by `(tenant_id, turn_id, request_id)`. At-least-once delivery means duplicates are possible; the consumer is responsible for ignoring replayed events.
@@ -4146,7 +4156,7 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
 - **Plugin unavailable**: outbox rows accumulate in `pending` status. The dispatcher retries with backoff. No data is lost; delivery resumes when the plugin recovers.
 - **Duplicate publish**: the dispatcher may re-publish a row if it crashes after sending but before marking `delivered`. The consumer deduplicates using the idempotency key `(tenant_id, turn_id, request_id)` from the `dedupe_key`.
-- **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_failed_total` metric. Operators investigate and may replay manually or fix the root cause.
+- **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_dead_total` metric. Operators investigate and may replay manually or fix the root cause.
 
 **Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls. The canonical outbox table schema and API are defined in [outbox-pattern.md](features/outbox-pattern.md). Detailed event payload schemas and envelope definitions remain deferred to P2+ (see section 5.6).
 
@@ -4848,10 +4858,12 @@ A monotonic, strictly increasing integer that identifies a specific immutable po
 
 **Bump Triggers**:
 - Changes to model catalog
-- Changes to multipliers or estimation budgets
-- Changes to kill switches
+- Changes to credit multipliers (`input_tokens_credit_multiplier`, `output_tokens_credit_multiplier`)
+- Changes to kill switches (`disable_premium_tier`, `force_standard_tier`, `disable_web_search`)
 - User allocation logic changes affecting `GetUserLimits` output
 - User entitlements/plan changes
+
+**Note (P1)**: Estimation budgets (image_token_budget, tool_surcharge_tokens, web_search_surcharge_tokens, etc.) are configured **locally in MiniChat ConfigMap**, NOT in CCM PolicySnapshot. Changes to estimation budgets do NOT trigger CCM policy version bumps. See section 5.2.1 "Estimation Budgets Source (P1)" for details.
 
 **MiniChat Integration**:
 - MiniChat caches snapshots keyed by `(tenant_id, policy_version)`.
