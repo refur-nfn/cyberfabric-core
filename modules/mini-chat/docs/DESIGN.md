@@ -4047,7 +4047,7 @@ Mini-Chat usage events use:
 > * `tenant_id` — resolved UUID from parent chat's tenant_id (chats.tenant_id via chat_turns.chat_id FK relationship), normalized to 32-char lowercase hex (strip hyphens)
 > * `turn_id` — persisted UUID from `chat_turns.id`, normalized to 32-char lowercase hex (strip hyphens)
 > * `request_id` — persisted UUID from `chat_turns.request_id` (client-provided UUID v4 or server-generated UUID v4), normalized to 32-char lowercase hex (strip hyphens)
-- `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `event_type`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
+- `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
 
 **Dedupe / unique constraint**: the partial unique index `(namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL` on `modkit_outbox_events` enforces at most one outbox event per turn invocation at the database level. All finalizers MUST insert the outbox row within the same transaction as the guarded state transition (CAS on `chat_turns.state = 'running'`, section 5.7) and quota settlement.
 
@@ -4263,7 +4263,7 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 - Settle using actual provider usage (`response.usage.input_tokens` + `response.usage.output_tokens`).
 - Release unused reserve, commit actual usage to `quota_usage` bucket rows (bucket `total` always; bucket `tier:premium` if premium turn).
 - If actual exceeds estimate (overshoot), commit the overshoot; never retroactively cancel a completed response.
-- Emit outbox event: `event_type = 'usage_finalized'`, `payload_json` MUST include:
+- Emit usage settlement outbox event with `payload_json` that MUST include:
   - `outcome`: `"completed"`
   - `settlement_method`: `"actual"`
   - `effective_model`, `selected_model`, `quota_decision` (and `downgrade_from`, `downgrade_reason` if present)
@@ -4430,7 +4430,6 @@ When a turn transitions to `ABORTED`, the system MUST emit a `modkit_outbox_even
 
 | Field | Value |
 |-------|-------|
-| `event_type` | `usage_finalized` |
 | `outcome` | `"aborted"` |
 | `settlement_method` | `"estimated"` (or `"actual"` if provider reported partial usage) |
 | `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
@@ -4554,7 +4553,6 @@ When a post-stream terminal error is finalized, the system MUST emit a `modkit_o
 
 | Field | Value |
 |-------|-------|
-| `event_type` | `usage_finalized` |
 | `outcome` | `"failed"` |
 | `settlement_method` | `"actual"` if provider reported usage; `"estimated"` otherwise |
 | `usage` | `{ input_tokens, output_tokens }` (token-denominated; actual if known, or estimated split) |
@@ -5045,10 +5043,11 @@ fn ceil_div(n, d) -> (n + d - 1) / d
 
 **Endpoint**: `POST /v1/usage/publish`
 
+This endpoint accepts usage settlement events from MiniChat for finalized turn outcomes.
+
 **Payload**:
 ```json
 {
-  "event_type": "usage_finalized",
   "tenant_id": "uuid",
   "user_id": "uuid",
   "chat_id": "uuid",
