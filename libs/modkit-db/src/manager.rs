@@ -96,31 +96,25 @@ impl DbManager {
             .extract()
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
 
-        let module_cfg: Option<DbConnConfig> = match module_data
+        let Some(db_value) = module_data
             .get("modules")
             .and_then(|modules| modules.get(module))
             .and_then(|m| m.get("database"))
-        {
-            None => None,
-            Some(db) => match serde_json::from_value(db.clone()) {
-                Ok(cfg) => Some(cfg),
-                Err(e) => {
-                    tracing::warn!(
-                        module = %module,
-                        error = %e,
-                        "Module 'database' key is present but failed to deserialize; ignoring"
-                    );
-                    None
-                }
-            },
+        else {
+            tracing::debug!(module = %module, "Module has no database configuration; skipping");
+            return Ok(None);
         };
 
-        let Some(mut cfg) = module_cfg else {
-            tracing::debug!(
-                module = %module,
-                "Module has no database configuration; skipping"
-            );
-            return Ok(None);
+        let mut cfg: DbConnConfig = match serde_json::from_value(db_value.clone()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(
+                    module = %module,
+                    error = %e,
+                    "Module 'database' key is present but failed to deserialize; ignoring"
+                );
+                return Ok(None);
+            }
         };
 
         // If module references a global server, merge configurations
