@@ -6,8 +6,8 @@ use modkit_macros::domain_model;
 pub struct Service {
     pub catalog: Vec<ModelCatalogEntry>,
     pub kill_switches: KillSwitches,
-    pub default_standard_limits: TierLimits,
-    pub default_premium_limits: TierLimits,
+    pub standard_limits: TierLimits,
+    pub premium_limits: TierLimits,
 }
 
 impl Service {
@@ -16,14 +16,14 @@ impl Service {
     pub fn new(
         catalog: Vec<ModelCatalogEntry>,
         kill_switches: KillSwitches,
-        default_standard_limits: TierLimits,
-        default_premium_limits: TierLimits,
+        standard_limits: TierLimits,
+        premium_limits: TierLimits,
     ) -> Self {
         Self {
             catalog,
             kill_switches,
-            default_standard_limits,
-            default_premium_limits,
+            standard_limits,
+            premium_limits,
         }
     }
 }

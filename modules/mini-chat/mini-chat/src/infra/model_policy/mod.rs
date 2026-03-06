@@ -95,7 +95,7 @@ impl ModelResolver for ModelPolicyGateway {
                 let default = snapshot
                     .model_catalog
                     .iter()
-                    .find(|m| m.is_default && m.global_enabled)
+                    .find(|m| m.preference.is_default && m.global_enabled)
                     .or_else(|| snapshot.model_catalog.iter().find(|m| m.global_enabled));
 
                 match default {

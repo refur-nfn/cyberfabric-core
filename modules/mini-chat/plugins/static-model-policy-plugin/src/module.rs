@@ -47,8 +47,8 @@ impl Module for StaticMiniChatModelPolicyPlugin {
         let service = Arc::new(Service::new(
             cfg.model_catalog,
             cfg.kill_switches,
-            cfg.default_standard_limits,
-            cfg.default_premium_limits,
+            cfg.standard_limits,
+            cfg.premium_limits,
         ));
         self.service
             .set(service.clone())

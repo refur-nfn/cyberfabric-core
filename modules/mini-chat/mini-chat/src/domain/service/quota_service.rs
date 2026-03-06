@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use mini_chat_sdk::{ModelTier, PolicySnapshot, UserLimits};
+use mini_chat_sdk::{ModelCatalogEntry, ModelTier, PolicySnapshot, UserLimits};
 use modkit_db::secure::DBRunner;
 use modkit_macros::domain_model;
 use modkit_security::AccessScope;
@@ -161,11 +161,12 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
             }
 
             // 3d. Select concrete model for this tier
+            let tier_matches = |m: &&ModelCatalogEntry| m.tier == tier && m.global_enabled;
             let model = catalog
                 .iter()
-                .filter(|m| m.tier == tier && m.global_enabled)
-                .find(|m| m.is_default)
-                .or_else(|| catalog.iter().find(|m| m.tier == tier && m.global_enabled));
+                .filter(|m| tier_matches(m))
+                .find(|m| m.preference.is_default)
+                .or_else(|| catalog.iter().find(|m| tier_matches(m)));
 
             let Some(effective) = model else {
                 continue; // all models in tier are individually disabled
@@ -193,12 +194,15 @@ impl<QR: QuotaUsageRepository> QuotaService<QR> {
 
 /// Map bucket name + `period_type` to the correct limit from `UserLimits`.
 fn limit_credits_micro(bucket: &str, period_type: &PeriodType, limits: &UserLimits) -> i64 {
-    match (bucket, period_type) {
-        ("total", PeriodType::Daily) => limits.standard.limit_daily_credits_micro,
-        ("total", PeriodType::Monthly) => limits.standard.limit_monthly_credits_micro,
-        ("tier:premium", PeriodType::Daily) => limits.premium.limit_daily_credits_micro,
-        ("tier:premium", PeriodType::Monthly) => limits.premium.limit_monthly_credits_micro,
-        _ => 0, // unknown bucket — no budget
+    let tier = match bucket {
+        "total" => &limits.standard,
+        "tier:premium" => &limits.premium,
+        _ => return 0, // unknown bucket — no budget
+    };
+
+    match period_type {
+        PeriodType::Daily => tier.limit_daily_credits_micro,
+        PeriodType::Monthly => tier.limit_monthly_credits_micro,
     }
 }
 
@@ -817,21 +821,104 @@ mod tests {
     use uuid::Uuid;
 
     fn make_model(id: &str, tier: ModelTier, enabled: bool, is_default: bool) -> ModelCatalogEntry {
+        use mini_chat_sdk::models::*;
+        use time::OffsetDateTime;
+
         ModelCatalogEntry {
             model_id: id.to_owned(),
             display_name: id.to_owned(),
+            description: String::new(),
+            version: String::new(),
+            provider_id: "openai".to_owned(),
+            provider_display_name: String::new(),
+            icon: String::new(),
             tier,
             global_enabled: enabled,
-            is_default,
-            input_tokens_credit_multiplier_micro: 1_000_000,
-            output_tokens_credit_multiplier_micro: 1_000_000,
             multimodal_capabilities: vec![],
             context_window: 128_000,
             max_output_tokens: 4096,
-            description: String::new(),
-            provider_display_name: String::new(),
+            max_input_tokens: 128_000,
+            input_tokens_credit_multiplier_micro: 1_000_000,
+            output_tokens_credit_multiplier_micro: 1_000_000,
             multiplier_display: "1x".to_owned(),
-            provider_id: "openai".to_owned(),
+            estimation_budgets: mini_chat_sdk::EstimationBudgets::default(),
+            max_retrieved_chunks_per_turn: 5,
+            general_config: ModelGeneralConfig {
+                config_type: String::new(),
+                tier: match tier {
+                    ModelTier::Premium => "premium",
+                    ModelTier::Standard => "standard",
+                }
+                .to_owned(),
+                model_credential_id: Uuid::nil(),
+                enabled,
+                available_from: OffsetDateTime::UNIX_EPOCH,
+                max_file_size_mb: 25,
+                api_params: ModelApiParams {
+                    temperature: 0.7,
+                    top_p: 1.0,
+                    frequency_penalty: 0.0,
+                    presence_penalty: 0.0,
+                    stop: vec![],
+                },
+                features: ModelFeatures {
+                    streaming: true,
+                    function_calling: false,
+                    structured_output: false,
+                    fine_tuning: false,
+                    distillation: false,
+                    fim_completion: false,
+                    chat_prefix_completion: false,
+                },
+                input_type: ModelInputType {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                },
+                tool_support: ModelToolSupport {
+                    web_search: false,
+                    file_search: false,
+                    image_generation: false,
+                    code_interpreter: false,
+                    computer_use: false,
+                    mcp: false,
+                },
+                supported_endpoints: ModelSupportedEndpoints {
+                    chat_completions: true,
+                    responses: false,
+                    realtime: false,
+                    assistants: false,
+                    batch_api: false,
+                    fine_tuning: false,
+                    embeddings: false,
+                    videos: false,
+                    image_generation: false,
+                    image_edit: false,
+                    audio_speech_generation: false,
+                    audio_transcription: false,
+                    audio_translation: false,
+                    moderations: false,
+                    completions: false,
+                },
+                token_policy: ModelTokenPolicy {
+                    input_tokens_credit_multiplier: 1.0,
+                    output_tokens_credit_multiplier: 1.0,
+                },
+                ux_profile: ModelUxProfile {
+                    multiplier_display: "1x".to_owned(),
+                    badge_text: String::new(),
+                },
+                performance: ModelPerformance {
+                    response_latency_ms: 500,
+                    speed_tokens_per_second: 100,
+                },
+            },
+            preference: ModelPreference {
+                is_default,
+                model_credential_id: Uuid::nil(),
+                sort_order: 0,
+            },
         }
     }
 
