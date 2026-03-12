@@ -353,7 +353,7 @@ pub struct UpdateUpstreamRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 pub struct CreateRouteRequest {
-    pub upstream_id: Uuid,
+    pub upstream_id: String,
     #[serde(rename = "match")]
     pub match_rules: MatchRules,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,7 +418,7 @@ pub struct UpstreamResponse {
 pub struct RouteResponse {
     pub id: String,
     pub tenant_id: Uuid,
-    pub upstream_id: Uuid,
+    pub upstream_id: String,
     #[serde(rename = "match")]
     pub match_rules: MatchRules,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -996,21 +996,6 @@ impl From<UpdateUpstreamRequest> for domain::UpdateUpstreamRequest {
             rate_limit: r.rate_limit.map(Into::into),
             cors: r.cors.map(Into::into),
             tags: r.tags,
-            enabled: r.enabled,
-        }
-    }
-}
-
-impl From<CreateRouteRequest> for domain::CreateRouteRequest {
-    fn from(r: CreateRouteRequest) -> Self {
-        Self {
-            upstream_id: r.upstream_id,
-            match_rules: r.match_rules.into(),
-            plugins: r.plugins.map(Into::into),
-            rate_limit: r.rate_limit.map(Into::into),
-            cors: r.cors.map(Into::into),
-            tags: r.tags,
-            priority: r.priority,
             enabled: r.enabled,
         }
     }

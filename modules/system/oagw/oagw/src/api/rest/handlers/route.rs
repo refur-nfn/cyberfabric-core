@@ -16,7 +16,7 @@ fn to_response(r: Route) -> RouteResponse {
     RouteResponse {
         id: gts::format_route_gts(r.id),
         tenant_id: r.tenant_id,
-        upstream_id: r.upstream_id,
+        upstream_id: gts::format_upstream_gts(r.upstream_id),
         match_rules: r.match_rules.into(),
         plugins: r.plugins.map(Into::into),
         rate_limit: r.rate_limit.map(Into::into),
@@ -32,11 +32,22 @@ pub async fn create_route(
     Extension(ctx): Extension<SecurityContext>,
     Json(req): Json<CreateRouteRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    let instance = "/oagw/v1/routes";
+    let upstream_uuid = parse_gts_id(&req.upstream_id, instance)?;
+    let domain_req = crate::domain::model::CreateRouteRequest {
+        upstream_id: upstream_uuid,
+        match_rules: req.match_rules.into(),
+        plugins: req.plugins.map(Into::into),
+        rate_limit: req.rate_limit.map(Into::into),
+        tags: req.tags,
+        priority: req.priority,
+        enabled: req.enabled,
+    };
     let route = state
         .cp
-        .create_route(&ctx, req.into())
+        .create_route(&ctx, domain_req)
         .await
-        .map_err(|e| domain_error_to_problem(e, "/oagw/v1/routes"))?;
+        .map_err(|e| domain_error_to_problem(e, instance))?;
     Ok((StatusCode::CREATED, Json(to_response(route))))
 }
 
