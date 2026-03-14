@@ -375,7 +375,7 @@ graph TB
 
 Preflight failures MUST be returned as normal JSON HTTP errors and MUST NOT open an SSE stream.
 
-Cancel/disconnect rule: if a stream ends without a terminal `done`/`error` event, `quota_service` MUST commit a bounded best-effort debit (default: the reserved estimate) so cancellations cannot evade quotas. The quota settlement and the corresponding `modkit_outbox_events` row MUST be written in the same DB transaction (see section 5.7 turn finalization contract).
+Cancel/disconnect rule: if a stream ends without a terminal `done`/`error` event, `quota_service` MUST commit a bounded best-effort debit (default: the reserved estimate) so cancellations cannot evade quotas. The quota settlement and the corresponding Mini-Chat outbox message enqueue MUST happen in the same DB transaction (see section 5.7 turn finalization contract).
 
 Reserve is an internal accounting concept (it may be implemented as held/pending fields or a row-level marker), but the observable external semantics MUST match the rules above.
 
@@ -404,7 +404,7 @@ System tasks (thread summary update, document summary generation) MUST be isolat
 
 1. System tasks MUST NOT participate in `chat_turns` idempotency and finalization CAS. They MUST NOT write to the `chat_turns` table and MUST NOT use `chat_turns.state` transitions.
 2. System tasks MUST NOT debit user quota tables (`quota_usage` rows keyed by `(user_id)`). They are not subject to per-user quota enforcement.
-3. System tasks MUST emit `modkit_outbox_events` usage events with `requester_type=system` (or equivalent field in the payload) so CyberChatManager can attribute cost to the tenant operational bucket, not to an individual user.
+3. System tasks MUST enqueue Mini-Chat usage messages through the shared `modkit_db::outbox` subsystem. The serialized usage payload MUST carry `requester_type=system` (or equivalent field in the payload) so CyberChatManager can attribute cost to the tenant operational bucket, not to an individual user.
 4. System tasks MUST follow the same provider-id sanitization rules as user turns (no provider identifiers in outbox payloads or audit events).
 5. System tasks MUST still obey global cost controls (tenant-level token budgets, kill switches) as defined in PRD section 5.6.
 
@@ -435,8 +435,9 @@ System tasks (thread summary update, document summary generation) MUST be isolat
    - MUST be a server-generated UUID v4 (unique per system task invocation)
    - NOT derived from any user request_id
    - Rationale: System tasks are idempotent on their own identity, not correlated with user turns
+   - For durable thread summary work, this stable `system_request_id` MUST be persisted on the `thread_summary_tasks` row at enqueue time and reused unchanged across every later claim, reclaim, retry, and terminal emission for that same durable task row.
 
-6. **Outbox `dedupe_key` format for system tasks:**
+6. **Serialized usage-event `dedupe_key` format for system tasks:**
 
    Since system tasks do NOT create `chat_turns` rows, the dedupe_key format is:
 
@@ -458,6 +459,7 @@ System tasks (thread summary update, document summary generation) MUST be isolat
    ```
 
    **Idempotency:** If a system task is retried (e.g., after failure), it MUST use the same `system_request_id` to prevent duplicate outbox events.
+   The same stable `system_request_id` MUST also be propagated as the system task `request_id` in audit events so that outbox and audit records share one durable idempotency/correlation key for that task invocation.
 
 **Quota enforcement:**
 
@@ -467,25 +469,23 @@ System tasks (thread summary update, document summary generation) MUST be isolat
 
 **Outbox payload schema for system tasks:**
 
+System-task usage messages are enqueued to the dedicated Mini-Chat usage outbox queue via `modkit_db::outbox`. The exact queue name is implementation-defined in P1. `payload_type` MUST identify the Mini-Chat usage schema/version and remain stable for all producers and consumers of that queue.
+
 ```json
 {
-  "namespace": "mini-chat",
-  "topic": "usage_snapshot",
-  "tenant_id": "<tenant_uuid>",
+  "event_type": "usage_snapshot",
   "dedupe_key": "{tenant_id}/{system_task_type}/{system_request_id}",
-  "payload": {
-    "tenant_id": "<tenant_uuid>",
-    "user_id": null,
-    "requester_type": "system",
-    "system_task_type": "thread_summary_update",
-    "chat_id": "<chat_uuid>",
-    "request_id": "<system_request_uuid>",
-    "usage": { "input_tokens": 5000, "output_tokens": 200 },
-    "actual_credits_micro": 125000,
-    "effective_model": "claude-opus-4",
-    "outcome": "completed",
-    "settlement_method": "actual"
-  }
+  "tenant_id": "<tenant_uuid>",
+  "user_id": null,
+  "requester_type": "system",
+  "system_task_type": "thread_summary_update",
+  "chat_id": "<chat_uuid>",
+  "request_id": "<system_request_uuid>",
+  "usage": { "input_tokens": 5000, "output_tokens": 200 },
+  "actual_credits_micro": 125000,
+  "effective_model": "claude-opus-4",
+  "outcome": "completed",
+  "settlement_method": "actual"
 }
 ```
 
@@ -496,8 +496,10 @@ System tasks do NOT create:
 - `messages` rows (unless the summary is persisted separately, P2+)
 
 System tasks DO create:
-- `modkit_outbox_events` rows (for billing attribution)
+- serialized outbox messages enqueued through `modkit_db::outbox` (for billing attribution)
 - Metrics/audit events (for observability)
+
+For automatic thread summary work, `thread_summary_tasks.system_request_id` is the authoritative persisted carrier of that stable system-task identity. It is generated exactly once when the durable task row is inserted and MUST be reused unchanged by reclaim/retry paths rather than regenerated per worker attempt.
 
 **Implementation guard:** Any code that assumes all LLM invocations have a corresponding `chat_turns` row is incorrect and will fail for system tasks.
 
@@ -507,7 +509,7 @@ System tasks DO create:
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-component-orphan-watchdog`
 
-- **orphan_watchdog** — P1 mandatory. Periodic background job that detects and cleans up turns abandoned by crashed pods. Transitions orphaned `running` turns to `failed` after a configurable timeout (default: 5 min), commits bounded quota debit, and emits a `modkit_outbox_events` row. MUST use leader election to ensure exactly one active watchdog instance per environment. See section "Turn Lifecycle, Crash Recovery and Orphan Handling" for full specification.
+- **orphan_watchdog** — P1 mandatory. Periodic background job that detects and cleans up turns abandoned by crashed pods. Transitions stale `running` turns to `failed` after a configurable timeout (default: 5 min) measured from durable `last_progress_at`, commits bounded quota debit, and enqueues the corresponding Mini-Chat usage message through `modkit_db::outbox`. MUST use leader election to ensure exactly one active watchdog instance per environment. See section "Turn Lifecycle, Crash Recovery and Orphan Handling" for full specification.
 
 ### 3.3 API Contracts
 
@@ -793,7 +795,7 @@ If `request_id` is omitted in the request body, the server MUST generate a UUID 
 2. Streams it back to the client as SSE without issuing a new provider request.
 3. MUST NOT take a new quota reserve.
 4. MUST NOT update `quota_usage` or debit tokens.
-5. MUST NOT insert a new `modkit_outbox_events` row.
+5. MUST NOT enqueue a new outbox message.
 6. MUST NOT emit audit or billing events.
 Replay is a pure read-and-relay operation — idempotent and side-effect-free with respect to settlement. Only the CAS-winning finalizer (during the original execution) writes settlement and outbox; replays and CAS-losers never do.
 
@@ -847,7 +849,7 @@ The Turn Status API `state: "error"` maps to internal `chat_turns.state = 'faile
 - **Do NOT assume `state: "error"` means "provider failure"**. Check `error_code`.
 - `orphan_timeout` indicates a **system timeout** (pod crash, network partition, orphan watchdog cleanup), not a provider-side error. The billing outcome for orphan timeout is `ABORTED` (estimated settlement), not `FAILED` (actual or released).
 - For UX error messages: `orphan_timeout` should display "Request timed out. Please try again." NOT "Provider error."
-- For operational dashboards: `orphan_timeout` metrics should be tracked separately from `provider_error` to distinguish infrastructure issues from LLM provider issues.
+- For operational dashboards: orphan-watchdog metrics (`mini_chat_orphan_detected_total{reason="stale_progress"}`, `mini_chat_orphan_finalized_total{reason="stale_progress"}`, `mini_chat_orphan_scan_duration_seconds`) should be tracked separately from `provider_error` to distinguish infrastructure issues from LLM provider issues.
 
 **Similarly, `state: "cancelled"` can map to billing outcome ABORTED:**
 - Client disconnect → internal `cancelled` → billing outcome `ABORTED` (estimated settlement)
@@ -1489,7 +1491,7 @@ sequenceDiagram
         else Frontier already advanced
             DB-->>CS: 0 rows updated
             CS->>DB: Mark task stale
-            CS->>CS: Finish without another LLM call
+            CS->>CS: Finish without another commit
         end
     end
 ```
@@ -1533,19 +1535,29 @@ Such heuristics MUST NOT be used as the sole correctness criterion for summary g
 - When a durable `thread_summary_tasks` row is inserted and later claimed, the worker MUST bind the run to the frozen target frontier persisted in that row in the per-chat message order `(created_at ASC, id ASC)`.
 - The worker MUST load exactly the non-deleted, non-compressed messages whose order key is in `(base_frontier, frozen_target_frontier]`.
 - Messages appended after `frozen_target_frontier` MUST be excluded from the current run. They MUST NOT cancel, widen, or invalidate the in-flight run and are eligible only for a future summary cycle.
-- The worker MUST call the LLM exactly once for that frozen range.
+- The worker MUST attempt at most one CAS-backed summary commit per claimed execution.
+- Reclaim eligibility is based on stale `claimed_at`, not on a fenced provider-completion signal. A reclaimed task MAY therefore start a second worker attempt for the same frozen range while an earlier attempt is still externally in flight or has already made the provider call.
 - If the LLM call succeeds, the worker MUST attempt one atomic commit that:
   1. saves the new `thread_summary`,
   2. advances the stored summary frontier to `frozen_target_frontier`, and
   3. marks exactly that summarized range as `is_compressed = true`.
 - The commit MUST succeed only if the stored summary frontier still equals the worker's `base_frontier` (compare-and-set).
-- If the CAS precondition fails because another worker already advanced the frontier, the task is stale and MUST finish without a second LLM call for the same frozen range.
-- If the LLM call fails (provider error, timeout), the system MUST keep the previous summary unchanged, MUST NOT advance the frontier, and MUST NOT mark messages as compressed. P1 does not automatically retry the same frozen range.
+- If the CAS precondition fails because another worker already advanced the frontier, the task is stale and MUST finish without another summary commit for that frozen range.
+- Duplicate provider/LLM calls for the same frozen range are an accepted P1 operational side effect under crash, restart, or reclaim timing. They are not a correctness violation by themselves.
+- The correctness boundary is narrower: the frozen range identity remains fixed, the same durable `system_request_id` remains fixed across reclaim, and no more than one successful CAS commit may advance the summary frontier for that frozen range.
+- If the LLM call fails (provider error, timeout), the system MUST keep the previous summary unchanged, MUST NOT advance the frontier, and MUST NOT mark messages as compressed. P1 does not automatically retry the same frozen range tuple unless a later trigger creates a different wider frozen range.
 - No length or entropy validation is performed in P1.
 
 Observability (P1):
 
-- Increment `mini_chat_summary_fallback_total` when the worker falls back due to provider failure.
+- Increment `mini_chat_summary_fallback_total` when the worker keeps the previous summary unchanged because the LLM call failed before a successful CAS commit.
+- Expose `mini_chat_thread_summary_backlog{state}` (gauge) with `state` from `pending|claimed|failed|stale`.
+- Expose `mini_chat_thread_summary_oldest_pending_age_seconds` (gauge).
+- Expose `mini_chat_thread_summary_oldest_claimed_age_seconds` (gauge).
+- Increment `mini_chat_thread_summary_reclaimed_total` when reconciliation returns an abandoned `claimed` task to `pending`.
+- Increment `mini_chat_thread_summary_llm_calls_total{result}` (counter) with a bounded `result` allowlist such as `ok|provider_error|timeout`.
+- `mini_chat_thread_summary_llm_calls_total{result}` MAY exceed the number of successfully committed summary tasks because reclaim or restart can trigger duplicate provider calls for the same frozen range; this is expected in P1 and MUST NOT by itself be interpreted as a correctness failure.
+- Increment `mini_chat_thread_summary_cas_conflicts_total` when a claimed task loses the CAS precondition and transitions to `stale`.
 
 ##### Execution model
 
@@ -1570,17 +1582,35 @@ The implementation MAY use an in-process notification mechanism such as `tokio::
 
 The leader MUST also run a periodic reconciliation loop to discover pending or abandoned tasks after restart, lease failover, or lost in-process notifications.
 
+P1 execution does not provide exactly-once provider invocation for automatic summary generation. Leader election determines who is allowed to claim work, but reclaim is still based on durable task staleness (`claimed_at`) rather than an external fenced lease with the provider. As a result, crash recovery or delayed completion MAY cause more than one provider call for the same frozen range. The persisted safety guarantee is limited to durable task identity, preserved `system_request_id`, and at-most-one successful CAS frontier advancement.
+
+**Thread summary worker configuration knobs** (deployment config):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `thread_summary_worker.enabled` | bool | true | Enables automatic thread summary background processing |
+| `thread_summary_worker.reconcile_interval_secs` | integer | 60 | Maximum interval between reconciliation scans for pending or abandoned tasks |
+| `thread_summary_worker.claim_timeout_secs` | integer | 300 | Abandonment timeout for a `claimed` task before it becomes reclaim-eligible |
+| `thread_summary_worker.max_attempts` | integer | 3 | Max claim/execution attempts per task before marking as `failed` |
+
 ##### Claim and recovery semantics
 
 - A leader worker MUST durably claim a `pending` `thread_summary_tasks` row before executing it.
 - Claiming MUST record durable in-DB claimed state (`status = claimed`, `claimed_by`, `claimed_at`) before any LLM call is issued.
-- If a leader crashes after claiming but before completion, another leader MAY reclaim the task after a lease-safe abandonment timeout or equivalent abandonment check.
+- A `claimed` task is reclaim-eligible only when `status = 'claimed'` and `claimed_at <= now() - interval '1 second' * thread_summary_worker.claim_timeout_secs`.
+- Reconciliation MUST run at least once per `thread_summary_worker.reconcile_interval_secs`.
+- Reconciliation MUST return an abandoned reclaim-eligible task to `pending`, clear `claimed_by`, refresh `updated_at`, and preserve both the frozen summary range and the persisted `system_request_id`.
+- Reclaim eligibility based on stale `claimed_at` MAY lead to a second worker attempt for the same frozen range.
+- Allowed recovery transitions are: `pending -> claimed`, `claimed -> pending` (abandoned reclaim), `claimed -> completed`, `claimed -> stale`, and `claimed -> failed`.
 - Reclaim MUST preserve the same frozen summary range and MUST NOT create a new automatic task for that range.
-- If the committed summary frontier has already advanced beyond the task's `base_frontier` when the task is processed or reclaimed, the task MUST transition to `stale` without issuing a new LLM call.
-- If the LLM call or execution fails before a successful CAS commit, the task MUST transition to `failed` and the frontier MUST NOT advance.
+- Therefore duplicate provider/LLM calls for that frozen range are operationally possible under crash, restart, or reclaim timing and are accepted in P1.
+- If the committed summary frontier has already advanced beyond the task's `base_frontier` when the task is processed or reclaimed, the task MUST transition to `stale` without attempting a new summary commit.
+- If the LLM call or execution fails before a successful CAS commit, the worker MUST increment the task's `attempt_count`. If `attempt_count < thread_summary_worker.max_attempts`, the task MUST transition back to `pending` for retry. If `attempt_count >= thread_summary_worker.max_attempts`, the task MUST transition to `failed` and the frontier MUST NOT advance.
 - If the CAS commit succeeds, the task MUST transition to `completed`.
+- The system MUST guarantee at most one successful CAS commit per frozen summary range.
+- The system MUST NOT claim or imply exactly-one provider invocation for a frozen summary range.
 
-##### Thread Summary Worker - Stable Range and No-Recompute Invariant
+##### Thread Summary Worker - Stable Range and Commit Invariant
 
 **Definitions**:
 
@@ -1610,26 +1640,34 @@ The implementation MUST enforce durable uniqueness of automatic tasks for that f
 
 If a later summary trigger observes the same frozen summary range, the system MUST NOT create or start another automatic task for that range.
 
-This invariant exists to guarantee that duplicate LLM summarization calls for the same message range cannot occur due to concurrent workers, repeated triggers, restart recovery, or leader failover.
+This invariant exists to guarantee that duplicate durable tasks and duplicate successful commits for the same frozen summary range cannot occur due to concurrent workers, repeated triggers, restart recovery, or leader failover.
 
 **Task stability and concurrency**:
 
 - Messages created after `frozen_target_frontier` remain outside the current run and are eligible only for a future run after the frontier advances.
 - The commit MUST be atomic and MUST advance the summary frontier only if the stored frontier still equals `base_frontier`.
-- Only one worker can win that compare-and-set. Any losing or stale worker MUST treat its task as stale, MUST NOT write a new summary, and MUST NOT issue another LLM call for the same frozen range as part of stale handling.
-- If the compare-and-set commit fails, the worker MUST terminate the task without issuing any additional LLM call.
+- Only one worker can win that compare-and-set. Any losing or stale worker MUST treat its task as stale and MUST NOT write a new committed summary for that frozen range.
+- If the compare-and-set commit fails, the worker MUST terminate the task without issuing any additional commit attempt for that task.
 
-**No-recompute invariant**:
+**Frozen-range commit invariant**:
 
 For P1 automatic background processing, a frozen summary range identified by
 `(chat_id, base_frontier, frozen_target_frontier)`
-MUST be selected for at most one automatic LLM summarization call.
+MUST have at most one successful summary commit.
 
-Concurrent workers, append-triggered rescheduling, restart recovery, or stale-task handling MUST NOT cause the same frozen range to be summarized again automatically.
+The durable `system_request_id` attached to that task MUST remain unchanged across claim, reclaim, retry, and stale-task handling for the same frozen range.
 
-Arrival of new messages after `frozen_target_frontier` MUST NOT cause the existing frozen range to be widened, re-selected, or recomputed.
+Concurrent workers, append-triggered rescheduling, restart recovery, or stale-task handling MUST NOT produce more than one committed summary result for the same frozen range.
 
-Manual or operator-driven recovery procedures, if introduced in a future phase, are outside the scope of this rule.
+Concurrent workers, reclaim after stale `claimed_at`, restart recovery, or leader failover MAY still produce duplicate external provider calls for that frozen range. P1 explicitly accepts that operational side effect. The persisted correctness guarantee is narrower: no more than one successful CAS commit may advance the summary frontier for that frozen range, and no second durable task identity may be created for the same frozen range.
+
+If a task for `(chat_id, base_frontier, frozen_target_frontier)` reaches `failed` after exhausting `thread_summary_worker.max_attempts`, the system MUST NOT automatically enqueue a second task for that same tuple.
+
+A `failed` task does not advance the frontier. To prevent a permanently stuck frontier the following recovery paths apply:
+
+1. **Wider-range supersession**: if later messages advance the chat frontier, the system MAY enqueue a new automatic task with the same `chat_id`, the same `base_frontier`, and a larger `frozen_target_frontier`. Such a wider-range task MAY re-summarize content that was included in the previously failed narrower range. This is intentional and valid in P1.
+2. **Operator intervention**: an operator MAY manually reset a `failed` task back to `pending` (clearing `attempt_count`) or delete it and enqueue a replacement. This is the expected P1 recovery path when no new messages arrive to trigger supersession.
+3. **Observability**: the metric `mini_chat_thread_summary_backlog{state="failed"}` MUST be monitored. An alert SHOULD fire when any task remains in `failed` for longer than a configurable threshold so that stuck frontiers are detected before they impact user experience.
 
 **P2+ — Summary quality gate (deferred):**
 
@@ -1646,7 +1684,8 @@ The following quality gate is deferred to P2+. It is preserved here for forward 
 Observability (P2+):
 
 - Increment `mini_chat_summary_regen_total{reason}` for each regeneration attempt (`reason` from a bounded allowlist such as `too_short|low_entropy|provider_error|invalid_format`).
-- Increment `mini_chat_summary_fallback_total` when the fallback behavior above is used (replaces the P1 metric of the same name).
+- `mini_chat_summary_regen_total{reason}` is P2+ only and MUST NOT be required or alerted on in P1 deployments.
+- Increment `mini_chat_summary_fallback_total` when the fallback behavior above is used. This extends the existing P1 metric rather than replacing it with a different series name.
 
 #### Cleanup on Chat Deletion
 
@@ -1679,7 +1718,8 @@ sequenceDiagram
         CS->>DB: Update attachment (cleanup_status = 'done')
     end
 
-    opt Chat has a vector store
+    opt Reconciliation sees persisted chat_vector_stores row and all attachment cleanup rows are done
+        CS->>DB: Re-read chat_vector_stores row for soft-deleted chat
         CS->>OG: DELETE /outbound/llm/vector_stores/{vector_store_id}
         OG->>OAI: Vector Stores API delete
         OAI-->>OG: OK (or 404 — already deleted)
@@ -1688,7 +1728,7 @@ sequenceDiagram
     end
 ```
 
-**Description**: Chat deletion is a two-phase operation: synchronous soft-delete (immediate 204 response) followed by asynchronous cleanup of external provider resources. The cleanup worker is responsible for removing external provider resources associated with soft-deleted chats. These resources include provider files and provider vector stores. Cleanup is performed asynchronously and is idempotent. The worker scans for attachments belonging to soft-deleted chats whose cleanup state is not terminal and performs provider deletion through OAGW.
+**Description**: Chat deletion is a two-phase operation: synchronous soft-delete (immediate 204 response) followed by asynchronous cleanup of external provider resources. The cleanup worker is responsible for removing external provider resources associated with soft-deleted chats. These resources include provider files and provider vector stores. Cleanup is performed asynchronously and is idempotent. The worker scans only attachments belonging to soft-deleted chats and performs provider deletion through OAGW. For provider-retention completion, attachment cleanup is complete only when every relevant attachment row is `done`; terminal `failed` rows remain unresolved cleanup debt. For vector-store cleanup, the remaining `chat_vector_stores` row is the durable marker that provider-side cleanup is still outstanding. A worker crash after the last attachment becomes `done` MUST NOT lose this work: periodic reconciliation MUST rediscover that row and retry vector-store deletion until success, `404 Not Found`, or blocking attachment cleanup debt.
 
 ##### Cleanup responsibility boundaries
 
@@ -1701,8 +1741,10 @@ Normative rules:
 
 - Attachment deletion (`DELETE /v1/chats/{chat_id}/attachments/{attachment_id}`) MUST use the transactional outbox mechanism to trigger provider deletion.
 - Chat deletion cleanup MUST be performed by the cleanup worker.
-- The cleanup worker MAY also act as a fallback mechanism for attachments that remain after failed outbox cleanup attempts.
+- The cleanup worker MAY act as a fallback mechanism only for attachments whose parent chat has already been soft-deleted.
+- A failed outbox-driven delete for an attachment whose parent chat is still active MUST remain owned by the attachment-delete path; it MUST NOT be silently picked up by the cleanup worker.
 - The two mechanisms MUST NOT both attempt cleanup for the same attachment simultaneously.
+- Ownership transfer from the attachment-delete path to the cleanup worker occurs only when the chat itself becomes soft-deleted, after which the cleanup worker exclusively owns provider cleanup for that attachment.
 
 ##### Attachment cleanup state machine
 
@@ -1724,8 +1766,11 @@ Normative rules:
 
 - `done` and `failed` are terminal states.
 - The cleanup worker MUST NOT reclaim rows in terminal states.
-- Retry backoff MUST be applied between attempts.
-- On retryable failure, the worker MUST increment `attachments.cleanup_attempts`, record `last_cleanup_error`, and reset `cleanup_status` to `pending`.
+- Retry backoff MUST be applied between attempts using truncated exponential backoff: delay = min(`cleanup_worker.backoff_base_secs` * 2^(`cleanup_attempts` - 1), `cleanup_worker.backoff_max_secs`). The worker MUST NOT re-claim a `pending` row whose `cleanup_updated_at + backoff_delay > now()`.
+- On retryable failure, the worker MUST increment `attachments.cleanup_attempts`, record `last_cleanup_error`, set `cleanup_updated_at = now()`, and reset `cleanup_status` to `pending`.
+- On successful claim, the worker MUST set `cleanup_status = 'in_progress'` and `cleanup_updated_at = now()`.
+- If a row remains `in_progress` past the configured stale-claim timeout without a newer `cleanup_updated_at`, reconciliation MUST increment `attachments.cleanup_attempts`, clear the stale claim by setting `cleanup_status = 'pending'`, and set `cleanup_updated_at = now()`.
+- `failed` is terminal for the row lifecycle, but it MUST NOT be treated as equivalent to cleanup completion for chat-level provider purge semantics.
 
 ##### Row claiming semantics
 
@@ -1736,17 +1781,24 @@ Normative rules:
 - Candidate selection MUST filter `attachments.cleanup_status = 'pending'` and `chats.deleted_at IS NOT NULL`.
 - Claim order SHOULD be `ORDER BY chats.deleted_at ASC`.
 - Each claim cycle MUST use `LIMIT cleanup_worker.batch_size`.
+- A reconciliation pass MUST run at least once per `cleanup_worker.reconcile_interval_secs` and MUST re-enqueue only rows whose parent chat is soft-deleted and whose `cleanup_status = 'in_progress'` with `cleanup_updated_at <= now() - interval '1 second' * cleanup_worker.stale_in_progress_timeout_secs`.
 
 ##### Vector store cleanup ordering
 
-Each chat has at most one vector store (created on first document upload). The `vector_store_id` is an opaque provider-assigned identifier stored in the `chat_vector_stores` table.
+Each chat has at most one vector store (created on first document upload). The `vector_store_id` is an opaque provider-assigned identifier stored in the `chat_vector_stores` table. In P1, the persisted `chat_vector_stores` row is also the durable marker that vector-store cleanup is still outstanding.
 
 Normative rules:
 
-- A chat vector store MUST be deleted only after all attachments belonging to the chat have reached a terminal cleanup state.
-- The worker MUST first clean up attachments, then check for any remaining non-terminal attachment cleanup rows for the chat, and delete the vector store only if none remain.
-- Provider `404 Not Found` responses for file deletion and vector store deletion MUST be treated as success.
-- After successful vector store deletion, the `chat_vector_stores` row MUST be deleted.
+- The cleanup worker exclusively owns vector-store deletion for soft-deleted chats.
+- The worker MUST periodically reconcile persisted `chat_vector_stores` rows whose parent chat is soft-deleted, even if no attachment row is currently `pending`.
+- A vector store is delete-eligible only if every attachment cleanup row for that soft-deleted chat is in a terminal state (`done` or `failed`) and none remain `pending` or `in_progress`.
+- Equivalently, the worker MUST NOT delete the vector store while any attachment cleanup row for that chat is `pending` or `in_progress`.
+- If the vector store becomes delete-eligible and any attachment row is `failed`, the worker MUST emit `mini_chat_cleanup_vector_store_with_failed_attachments_total` before proceeding with vector-store deletion. The metric signals that provider-side file cleanup debt remains, but the vector store itself is no longer retained as a blocking resource.
+- If a vector store is delete-eligible, the worker MUST attempt provider deletion through OAGW.
+- Provider `404 Not Found` for vector-store deletion MUST be treated as success.
+- On successful delete or `404 Not Found`, the worker MUST delete the corresponding `chat_vector_stores` row. Deleting that row is the durable completion marker for vector-store cleanup.
+- On retryable provider or infrastructure failure, the worker MUST leave the `chat_vector_stores` row unchanged and retry in a later reconciliation cycle.
+- P1 does not require a separate vector-store-specific persisted `pending|in_progress|failed` state machine. Recovery is driven by periodic reconciliation over the persisted `chat_vector_stores` row plus attachment cleanup state.
 
 ##### Additional invariants
 
@@ -1754,7 +1806,7 @@ Normative rules:
 
 2. **No identifier reuse**: `vector_store_id` and `provider_file_id` are provider-assigned opaque identifiers. Mini Chat MUST NOT assume or rely on any reuse semantics — each provider resource has a unique lifecycle. Since chat IDs are UUIDs, the scenario of "chat recreated with the same ID" does not occur in practice; soft-deleted chat rows are retained for audit and are excluded from active queries by `deleted_at IS NOT NULL`.
 
-3. **Failure tolerance**: if the cleanup worker is unavailable because of worker downtime, provider errors, database outages, or service restarts, provider resources remain allocated but are not accessible to users (the chat is soft-deleted). This is operationally acceptable — the resources are cleaned up when the worker resumes. The `mini_chat_cleanup_pending` gauge metric tracks the backlog.
+3. **Failure tolerance**: if the cleanup worker crashes or restarts after the last attachment row reaches a terminal state but before vector-store deletion completes, the remaining `chat_vector_stores` row preserves the outstanding cleanup work. Periodic reconciliation MUST rediscover and retry that vector-store deletion. A chat is not fully purged from provider storage until both conditions hold: (a) every relevant attachment cleanup row is in a terminal state (`done` or `failed`), and (b) the corresponding `chat_vector_stores` row has been removed after provider delete success or `404 Not Found`. If any attachment row is `failed`, individual provider-file cleanup debt remains unresolved, but vector-store deletion is not blocked — the worker proceeds with vector-store deletion and emits `mini_chat_cleanup_vector_store_with_failed_attachments_total`. Because `failed` rows are terminal in P1 and excluded from automatic re-enqueue, clearing per-file debt requires operator intervention or a future recovery policy outside P1 scope. Canonical backlog visibility MUST use `mini_chat_cleanup_backlog{state,resource_type="file"}` for persisted attachment row states only.
 
 **Cleanup configuration knobs** (deployment config):
 
@@ -1762,16 +1814,22 @@ Normative rules:
 |-----|------|---------|-------------|
 | `cleanup_worker.enabled` | bool | true | Enables the cleanup worker |
 | `cleanup_worker.poll_interval_secs` | integer | 60 | Cleanup worker poll interval |
+| `cleanup_worker.reconcile_interval_secs` | integer | 300 | Maximum interval between reconciliation scans for stuck `in_progress` rows |
+| `cleanup_worker.stale_in_progress_timeout_secs` | integer | 900 | Timeout after which a soft-deleted chat attachment stuck in `in_progress` becomes re-enqueue eligible |
 | `cleanup_worker.batch_size` | integer | 32 | Max attachments claimed per poll cycle |
 | `cleanup_worker.max_attempts` | integer | 5 | Max retry attempts per attachment before marking as `failed` |
+| `cleanup_worker.backoff_base_secs` | integer | 1 | Base delay for truncated exponential backoff between retries |
+| `cleanup_worker.backoff_max_secs` | integer | 60 | Maximum backoff delay cap |
 
 **Observability (P1)**:
 
 - `mini_chat_cleanup_completed_total{resource_type="file|vector_store"}` (counter) — successful cleanup operations
-- `mini_chat_cleanup_failed_total{resource_type="file|vector_store"}` (counter) — cleanup operations that transition to terminal `failed`
-- `mini_chat_cleanup_pending` (gauge) — attachments belonging to soft-deleted chats with `cleanup_status = 'pending'`
+- `mini_chat_cleanup_failed_total{resource_type="file"}` (counter) — attachment cleanup rows that transition to terminal `failed`
+- `mini_chat_cleanup_retry_total{resource_type="file|vector_store",reason}` (counter) — retryable cleanup attempts
+- `mini_chat_cleanup_backlog{state,resource_type="file"}` (gauge) — canonical cleanup backlog metric for persisted attachment row states only; `state` MUST cover `pending|in_progress|failed`
+- Any pending-only operational view SHOULD be derived from `mini_chat_cleanup_backlog{state="pending",resource_type="file"}` rather than treated as a separate canonical metric.
 
-The `resource_type` label distinguishes file cleanup and vector store cleanup.
+Vector-store cleanup does not have an independent persisted `pending|in_progress|failed` state machine in P1. Any vector-store visibility MUST therefore be expressed as counters or derived reconciliation queries over `chat_vector_stores`, not as file-style state backlog metrics.
 
 ### 3.7 Database Schemas & Tables
 
@@ -1862,6 +1920,7 @@ Tracks idempotency and in-progress generation state for `request_id`. This avoid
 | deleted_at | TIMESTAMPTZ | Soft-delete timestamp for turn mutations (nullable). Set when a turn is replaced by retry or edit, or explicitly deleted. |
 | replaced_by_request_id | UUID | `request_id` of the new turn that replaced this one via retry or edit (nullable). Stored on the old (soft-deleted) turn to provide audit traceability. Not used by delete. |
 | started_at | TIMESTAMPTZ | DB-assigned turn creation timestamp (set on INSERT). Used for ordering and latest-turn selection in P1. |
+| last_progress_at | TIMESTAMPTZ | Durable liveness timestamp for running turns. MUST be initialized when the turn enters `running` and MUST be updated on meaningful forward progress, including provider chunk receipt, SSE relay progress, tool event progress if such events are durably persisted for the turn, and terminal provider event reception. |
 | completed_at | TIMESTAMPTZ | Completion time (nullable) |
 | updated_at | TIMESTAMPTZ | Last update time |
 
@@ -1873,6 +1932,7 @@ Tracks idempotency and in-progress generation state for `request_id`. This avoid
 - CHECK `requester_type IN ('user', 'system')`
 - CHECK `(state IN ('completed', 'failed', 'cancelled') AND completed_at IS NOT NULL) OR (state NOT IN ('completed', 'failed', 'cancelled'))` — **Prevents half-finalized turns after crashes or partial writes**. Terminal states (completed/failed/cancelled) MUST have `completed_at` timestamp. This guarantees that any terminal state implies finalization timestamp is present, supporting exactly-once settlement/outbox semantics and simplifying crash recovery reasoning.
 - CHECK `(state = 'running' AND completed_at IS NULL) OR (state != 'running')` — **Running turns cannot have `completed_at` timestamp**. Prevents premature completion marking before finalization logic completes.
+- CHECK `(state = 'running' AND last_progress_at IS NOT NULL) OR (state != 'running')` — **Running turns MUST have a durable progress timestamp** so orphan detection can distinguish stalled execution from long-running healthy execution.
 
 **Indexes (P1)**:
 - `(chat_id, started_at DESC) WHERE deleted_at IS NULL`
@@ -1916,7 +1976,7 @@ Soft-delete rules:
 | img_thumbnail_height | INTEGER | Thumbnail height in pixels (nullable) |
 | summary_model | TEXT | Model used to generate the summary (nullable) |
 | summary_updated_at | TIMESTAMPTZ | When the summary was last generated (nullable) |
-| cleanup_status | VARCHAR(16) | `pending`, `in_progress`, `done`, `failed` (nullable) |
+| cleanup_status | VARCHAR(16) | `pending`, `in_progress`, `done`, `failed` (nullable). For chat-level provider purge semantics, only `done` counts as cleanup complete; `failed` remains unresolved cleanup debt. |
 | cleanup_attempts | INTEGER | Cleanup retry attempts (default 0) |
 | last_cleanup_error | TEXT | Last cleanup error (nullable) |
 | cleanup_updated_at | TIMESTAMPTZ | When cleanup state was last updated (nullable) |
@@ -1976,6 +2036,7 @@ Writers MUST populate `chat_id` from the parent message's `messages.chat_id` (no
 | base_frontier_message_id | UUID | Base frontier `id` component (nullable only when the chat has no committed `thread_summaries` row yet) |
 | frozen_target_created_at | TIMESTAMPTZ | Frozen target frontier `created_at` component |
 | frozen_target_message_id | UUID | Frozen target frontier `id` component |
+| system_request_id | UUID | Stable system-task request identifier generated when the durable task row is inserted and reused unchanged across reclaim/retry/outbox/audit emission for that same task |
 | status | TEXT | Task lifecycle state: `pending`, `claimed`, `completed`, `stale`, or `failed` |
 | claimed_by | TEXT | Leader identity that claimed the task (nullable; pod name or process identity) |
 | claimed_at | TIMESTAMPTZ | Durable claim timestamp (nullable) |
@@ -1985,7 +2046,7 @@ Writers MUST populate `chat_id` from the parent message's `messages.chat_id` (no
 
 **PK**: `id`
 
-**Constraints**: FK `chat_id` -> `chats.id` ON DELETE CASCADE. NOT NULL on `chat_id`, `frozen_target_created_at`, `frozen_target_message_id`, `status`, `created_at`, `updated_at`. CHECK `status IN ('pending', 'claimed', 'completed', 'stale', 'failed')`. CHECK `(base_frontier_created_at IS NULL) = (base_frontier_message_id IS NULL)`. The tuple `(chat_id, base_frontier_created_at, base_frontier_message_id, frozen_target_created_at, frozen_target_message_id)` uniquely identifies the frozen summary range. The implementation MUST enforce uniqueness of automatic tasks for that frozen summary range, including the empty-frontier case where both `base_frontier_*` columns are NULL. `base_frontier_*` columns are NULL only when the chat has no committed `thread_summaries` row yet.
+**Constraints**: FK `chat_id` -> `chats.id` ON DELETE CASCADE. NOT NULL on `chat_id`, `frozen_target_created_at`, `frozen_target_message_id`, `system_request_id`, `status`, `created_at`, `updated_at`. CHECK `status IN ('pending', 'claimed', 'completed', 'stale', 'failed')`. CHECK `(base_frontier_created_at IS NULL) = (base_frontier_message_id IS NULL)`. The tuple `(chat_id, base_frontier_created_at, base_frontier_message_id, frozen_target_created_at, frozen_target_message_id)` uniquely identifies the frozen summary range. The implementation MUST enforce uniqueness of automatic tasks for that frozen summary range, including the empty-frontier case where both `base_frontier_*` columns are NULL. `base_frontier_*` columns are NULL only when the chat has no committed `thread_summaries` row yet.
 
 **Implementation note**: In Postgres, a standard UNIQUE constraint does not treat `NULL` values as equal. Therefore, the implementation MUST enforce frozen-range uniqueness for the empty-frontier case explicitly, for example via:
 - a partial unique index for rows where both `base_frontier_*` columns are NULL, plus
@@ -2001,6 +2062,7 @@ or an equivalent generated-key strategy.
 - `completed` — the successful summary commit already advanced the frontier.
 - `stale` — another worker or task already advanced the frontier and this task can no longer commit.
 - `failed` — the LLM call or execution failed and the frontier was not advanced.
+- `system_request_id` remains stable across all non-terminal and terminal transitions of the row and MUST NOT be regenerated by reclaim or retry logic.
 
 **Durable task semantics (normative)**: This table is the authoritative source of truth for automatic thread summary task existence, deduplication, claim state, recovery, and failover safety. It is independent from `chat_turns` and is not user-visible.
 
@@ -2060,6 +2122,8 @@ Pending and in-flight automatic summary work MUST be stored in `thread_summary_t
 **PK**: `id`
 
 **Constraints**: UNIQUE on `(tenant_id, chat_id)`. NOT NULL on `provider`, `created_at`. `vector_store_id` is nullable (NULL while provider creation is in progress). One vector store per chat within a tenant.
+
+**Cleanup invariant**: while a soft-deleted chat still has a `chat_vector_stores` row, provider-side vector-store cleanup is considered outstanding; the row MUST be removed only after successful provider deletion or `404 Not Found`.
 
 **Secure ORM**: No independent `#[secure]` — accessed through parent chat. The table has no `user_id` column; owner isolation is inherited from chat-level scoping (`chat_id` obtained from a scoped chat query). All queries MUST include `tenant_id` in the WHERE clause (enforced by the chat-level `AccessScope`).
 
@@ -2663,7 +2727,7 @@ Chat content may contain PII or sensitive data. Mini Chat treats messages and su
 
 **Retention**:
 - Chats are retained until explicit deletion by default, subject to operator-configured retention policies.
-- Soft-deleted chats (`deleted_at` set) are hard-purged by a periodic cleanup job after a configurable grace period.
+- Soft-deleted chats (`deleted_at` set) are eligible for hard purge by a periodic cleanup job after a configurable grace period, but they MUST NOT be treated as fully provider-purged while any attachment cleanup row remains not `done`.
 - Temporary chat auto-deletion (24h TTL) is deferred to P2.
 
 **Audit content handling (P1)**:
@@ -2974,19 +3038,19 @@ Deletion follows a two-phase approach using the transactional outbox pattern (se
 **Phase 1 — Transactional commit (synchronous, within the HTTP request)**:
 
 1. Soft-delete the `attachments` row (`deleted_at = now()`).
-2. Insert a `modkit_outbox_events` row with `event_type = "attachment_cleanup"` containing `provider_file_id` and `vector_store_id` in the payload.
-3. Both writes execute in a single DB transaction. The endpoint returns `204 No Content` once the transaction commits.
+2. Enqueue an `attachment_cleanup` message through `modkit_db::outbox::Outbox::enqueue(...)` (or the equivalent helper) with `provider_file_id` and `vector_store_id` in the serialized payload.
+3. The soft-delete and the outbox enqueue execute in the same DB transaction. The endpoint returns `204 No Content` once the transaction commits.
 
 After Phase 1 commits, the attachment is **immediately invisible** to retrieval: the `file_search` tool inclusion check counts only `status = 'ready' AND deleted_at IS NULL` attachments, and vector store queries are scoped to attachments present in `chat_vector_stores` metadata — the soft-deleted attachment is excluded from both paths.
 
-**Phase 2 — Asynchronous cleanup (outbox relay)**:
+**Phase 2 — Asynchronous cleanup (decoupled outbox handler)**:
 
-The outbox relay picks up the `attachment_cleanup` event and performs provider-side cleanup:
+The shared outbox pipeline delivers the `attachment_cleanup` message to the Mini-Chat decoupled handler, which performs provider-side cleanup:
 
 1. Remove the document from the chat vector store (provider Vector Stores API).
 2. Delete the file from the provider Files API.
 
-If either provider call fails, the outbox relay retries with exponential backoff (standard outbox retry policy). Partial failure is safe: the attachment is already soft-deleted and excluded from retrieval. Provider-side orphans are eventually cleaned up by retries or by the chat deletion cleanup worker.
+If either provider call fails transiently, the handler MUST return `Retry` so the shared outbox applies lease-aware retry/backoff. If the message is permanently malformed or unrecoverable, the handler MAY return `Reject`, which moves the message to the shared outbox dead-letter store for operator recovery. Partial failure is safe: the attachment is already soft-deleted and excluded from retrieval. Provider-side orphans are eventually cleaned up by retries, dead-letter replay, or by the chat deletion cleanup worker.
 
 **Invariants**:
 
@@ -3398,6 +3462,12 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_cancel_orphan_total` (counter; a turn remained `running` longer than a configured timeout after cancellation)
 - `mini_chat_streams_aborted_total{trigger}` (counter; turn transitioned to `ABORTED` billing state; `trigger`: `client_disconnect|pod_crash|orphan_timeout|internal_abort`)
 
+##### Orphan watchdog
+
+- `mini_chat_orphan_detected_total{reason}` (counter; increments when the watchdog identifies an orphan candidate by the stale-progress rule; `reason`: `stale_progress`)
+- `mini_chat_orphan_finalized_total{reason}` (counter; increments only when the watchdog wins the CAS finalization and transitions the turn to terminal orphan outcome; `reason`: `stale_progress`)
+- `mini_chat_orphan_scan_duration_seconds` (histogram; watchdog scan execution duration)
+
 ##### Quota and cost control
 
 - `mini_chat_quota_preflight_total{decision,model,tier}` (counter; `decision`: `allow|downgrade|reject`; `tier`: `premium|standard`)
@@ -3435,8 +3505,13 @@ The following metric series MUST be exposed (types and label sets shown). These 
 
 ##### Thread summary health
 
-- `mini_chat_summary_regen_total{reason}` (counter; `reason` MUST be from a bounded allowlist)
 - `mini_chat_summary_fallback_total` (counter)
+- `mini_chat_thread_summary_backlog{state}` (gauge; `state`: `pending|claimed|failed|stale`)
+- `mini_chat_thread_summary_oldest_pending_age_seconds` (gauge)
+- `mini_chat_thread_summary_oldest_claimed_age_seconds` (gauge)
+- `mini_chat_thread_summary_reclaimed_total` (counter)
+- `mini_chat_thread_summary_llm_calls_total{result}` (counter; `result`: `ok|provider_error|timeout`)
+- `mini_chat_thread_summary_cas_conflicts_total` (counter)
 
 ##### Turn mutations
 
@@ -3479,7 +3554,7 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_cleanup_attempts_total{op,result}` (counter; `op`: `vs_remove|file_delete`; `result`: `ok|not_found_ok|retryable_fail|fatal_fail`)
 - `mini_chat_cleanup_orphan_found_total{kind}` (counter; `kind`: `provider_file|vs_entry`)
 - `mini_chat_cleanup_orphan_fixed_total{kind}` (counter)
-- `mini_chat_cleanup_backlog{state}` (gauge; `state`: `pending|in_progress|failed`)
+- `mini_chat_cleanup_backlog{state,resource_type="file"}` (gauge; canonical cleanup backlog family for persisted attachment row states only. `state`: `pending|in_progress|failed`)
 - `mini_chat_cleanup_latency_ms{op}` (histogram)
 
 ##### Audit emission health
@@ -3488,20 +3563,18 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_audit_redaction_hits_total{pattern}` (counter; `pattern` MUST be from a bounded allowlist)
 - `mini_chat_audit_emit_latency_ms` (histogram)
 
-##### Outbox health and monitoring (P1)
+##### Outbox integration health and monitoring (P1)
 
-- `mini_chat_outbox_dead_total` (counter; total outbox events that reached `dead` status after max retry attempts)
-- `mini_chat_outbox_pending_age_seconds` (histogram; age of pending outbox events in seconds; measured from `created_at` to `now()`)
-- `mini_chat_outbox_dead_rows` (gauge; current count of dead outbox rows with `namespace='mini-chat'` and `status='dead'`)
-- `mini_chat_outbox_oldest_pending_age_seconds` (gauge; age of oldest pending row in seconds)
-- `mini_chat_outbox_enqueue_total{result}` (counter; `result`: `ok|dedupe`)
-- `mini_chat_outbox_dispatch_total{result}` (counter; `result`: `delivered|retryable_error|dead`)
+- `mini_chat_outbox_enqueue_total{kind,result}` (counter; `kind`: `usage|attachment_cleanup`; `result`: `ok|error`)
+- `mini_chat_outbox_handler_total{kind,result}` (counter; `kind`: `usage|attachment_cleanup`; `result`: `success|retry|reject`)
+- `mini_chat_outbox_dead_letter_backlog{kind}` (gauge; current pending dead-letter count for Mini-Chat messages filtered by queue/payload_type)
+- `mini_chat_outbox_dead_letter_oldest_age_seconds{kind}` (gauge; age of oldest pending dead letter for Mini-Chat messages)
 
 **Health degradation rules**:
-- If `mini_chat_outbox_dead_rows > 100` (configurable threshold): health status SHOULD be `degraded` with reason "Outbox has N dead rows (threshold: M)"
-- If `mini_chat_outbox_oldest_pending_age_seconds > 3600` (1 hour): health status SHOULD be `degraded` with reason "Oldest pending outbox event is N seconds old"
+- If `mini_chat_outbox_dead_letter_backlog{kind="usage"} > 0`: health status SHOULD be `degraded` with reason "Mini-Chat usage outbox has pending dead letters"
+- If `mini_chat_outbox_dead_letter_oldest_age_seconds{kind="usage"} > 3600` (1 hour): health status SHOULD be `degraded` with reason "Oldest Mini-Chat usage dead letter is N seconds old"
 
-**Periodic collector**: A background task MUST periodically (recommended: every 60 seconds) query `modkit_outbox_events` table to update gauge metrics (`mini_chat_outbox_dead_rows`, `mini_chat_outbox_oldest_pending_age_seconds`).
+**Ownership note**: queue depth, claim/reclaim, lease, sequencer, and vacuum internals are owned by the shared `modkit-db::outbox` subsystem and SHOULD be consumed from its infrastructure metrics surface rather than re-specified as Mini-Chat row-state metrics.
 
 ##### DB health (infra/storage)
 
@@ -3514,7 +3587,12 @@ The following metric series MUST be exposed (types and label sets shown). These 
 - `mini_chat_time_to_abort_ms` p99 > 200 ms
 - `mini_chat_active_streams` approaching configured concurrency cap
 - Provider error spikes: elevated `mini_chat_provider_errors_total{status=~"429|5.."}`
-- Cleanup backlog growth: rising `mini_chat_cleanup_backlog{state="pending"}` or sustained `failed`
+- Summary queue lag: sustained `mini_chat_thread_summary_oldest_pending_age_seconds` above the expected reconciliation window
+- Summary stuck claims: sustained `mini_chat_thread_summary_oldest_claimed_age_seconds` above `thread_summary_worker.claim_timeout_secs`
+- Summary failures: sustained `mini_chat_thread_summary_backlog{state=~"failed|stale"}` above normal background noise
+- Orphan watchdog activity: sustained increase in `mini_chat_orphan_detected_total{reason="stale_progress"}` without a corresponding increase in `mini_chat_orphan_finalized_total{reason="stale_progress"}`
+- Cleanup backlog growth: rising `mini_chat_cleanup_backlog{state="pending",resource_type="file"}` or sustained `mini_chat_cleanup_backlog{state="failed",resource_type=~"file|vector_store"}`
+- Mini-Chat usage dead letters: `mini_chat_outbox_dead_letter_backlog{kind="usage"}` > 0
 - Audit emission failures: sustained `mini_chat_audit_emit_total{result="failed"}`
 - Quota anomalies: sustained increase in `mini_chat_quota_negative_total`
 
@@ -3532,8 +3610,14 @@ Alerts (P1) are defined as explicit condition -> window -> severity mappings:
 | `mini_chat_time_to_abort_ms` p99 > 200 ms | 5m | critical |
 | `mini_chat_audit_emit_total{result="failed"}` > 0 | 5m | critical |
 | Provider failure rate `rate(mini_chat_provider_errors_total[5m]) / rate(mini_chat_provider_requests_total[5m])` exceeds configured threshold | 5m | critical |
-| `mini_chat_cleanup_backlog{state="pending"}` grows monotonically | 60m | warning |
-| `mini_chat_cleanup_backlog{state="failed"}` > 0 | 15m | critical |
+| `mini_chat_thread_summary_oldest_pending_age_seconds` exceeds `thread_summary_worker.reconcile_interval_secs` | 15m | warning |
+| `mini_chat_thread_summary_oldest_claimed_age_seconds` exceeds `thread_summary_worker.claim_timeout_secs` | 15m | critical |
+| `mini_chat_thread_summary_backlog{state=~"failed|stale"}` > 0 | 15m | warning |
+| `rate(mini_chat_orphan_detected_total{reason="stale_progress"}[15m]) > 0` AND `rate(mini_chat_orphan_finalized_total{reason="stale_progress"}[15m]) = 0` | 15m | critical |
+| `mini_chat_cleanup_backlog{state="pending",resource_type="file"}` grows monotonically | 60m | warning |
+| `mini_chat_cleanup_backlog{state="failed",resource_type=~"file|vector_store"}` > 0 | 15m | critical |
+| `mini_chat_outbox_dead_letter_backlog{kind="usage"}` > 0 | 15m | critical |
+| `mini_chat_outbox_dead_letter_oldest_age_seconds{kind="usage"}` > 3600 | 15m | warning |
 
 ### Operational Traceability and Debugging (P1)
 
@@ -3605,7 +3689,8 @@ Operators MUST be able to reconstruct the full request lifecycle using logs, tra
 5. Consult operational dashboards/alerts:
   - streaming health (`mini_chat_stream_failed_total`, `mini_chat_provider_errors_total`)
   - cancellation health (`mini_chat_time_to_abort_ms`, `mini_chat_cancel_orphan_total`)
-  - summary health (`mini_chat_summary_regen_total`, `mini_chat_summary_fallback_total`)
+  - orphan watchdog health (`mini_chat_orphan_detected_total{reason="stale_progress"}`, `mini_chat_orphan_finalized_total{reason="stale_progress"}`, `mini_chat_orphan_scan_duration_seconds`)
+  - summary health (`mini_chat_summary_fallback_total`, `mini_chat_thread_summary_backlog`, `mini_chat_thread_summary_oldest_pending_age_seconds`, `mini_chat_thread_summary_oldest_claimed_age_seconds`, `mini_chat_thread_summary_reclaimed_total`, `mini_chat_thread_summary_cas_conflicts_total`)
   - cleanup/audit health (`mini_chat_cleanup_backlog`, `mini_chat_audit_emit_total`)
 
 ### SSE Infrastructure Requirements
@@ -3647,7 +3732,7 @@ stateDiagram-v2
     running --> completed: Provider terminal done/incomplete event<br/>(response.completed or response.incomplete)<br/>(CAS: WHERE state='running')
     running --> failed: Provider terminal error<br/>(CAS: WHERE state='running')
     running --> cancelled: Client disconnect<br/>(CAS: WHERE state='running')
-    running --> failed: Orphan watchdog timeout<br/>(error_code='orphan_timeout')<br/>(CAS: WHERE state='running')
+    running --> failed: Orphan watchdog timeout<br/>(error_code='orphan_timeout')<br/>(CAS: WHERE state='running' AND deleted_at IS NULL AND last_progress_at <= now() - orphan_timeout)
 
     completed --> [*]: Terminal state<br/>(immutable)
     failed --> [*]: Terminal state<br/>(immutable)
@@ -3704,24 +3789,44 @@ The system does NOT attempt to resume, reconnect, or hand off the stream to anot
 
 A periodic background job detects and cleans up turns abandoned by crashed pods.
 
-**Condition**: `chat_turns.state = 'running' AND chat_turns.started_at < now() - :orphan_timeout`
+**Condition**: `chat_turns.state = 'running' AND chat_turns.deleted_at IS NULL AND chat_turns.last_progress_at <= now() - :orphan_timeout`
 
 **Timeout**: configurable per deployment; default: 5 minutes.
 
 > Where:
 >
-> * `:orphan_timeout` — interval duration in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `orphan_watchdog.timeout_seconds` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `60 <= timeout_seconds <= 3600`. Values outside this range MUST be rejected as invalid configuration.
-> * `started_at` — persisted timestamp from `chat_turns.started_at` (TIMESTAMPTZ, immutable after insert, set at turn creation)
+> * `:orphan_timeout` — interval duration in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `orphan_watchdog.timeout_secs` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `60 <= timeout_secs <= 3600`. Values outside this range MUST be rejected as invalid configuration.
+> * `last_progress_at` — persisted timestamp from `chat_turns.last_progress_at` (TIMESTAMPTZ). It MUST be initialized when the turn enters `running` and MUST be updated on meaningful forward progress, including provider chunk receipt, SSE relay progress, tool event progress if such events are durably persisted for the turn, and terminal provider event reception.
 > * `now()` — current database server time (UTC). The watchdog query MUST use `now()` (Postgres server time) for monotonic clock consistency, not application-side timestamps.
-> * **Configuration change semantics**: changes to `orphan_watchdog.timeout_seconds` take effect at the next watchdog poll cycle. In-flight turns are subject to the timeout value active at the time the watchdog evaluates them. This means a ConfigMap change can immediately affect which turns are classified as orphaned (operational note; deterministic per evaluation instant).
+> * **Configuration change semantics**: changes to `orphan_watchdog.timeout_secs` take effect at the next watchdog poll cycle. In-flight turns are subject to the timeout value active at the time the watchdog evaluates them. This means a ConfigMap change can immediately affect which turns are classified as orphaned (operational note; deterministic per evaluation instant).
 
-**Action** (all steps in a single DB transaction, using the finalization CAS guard defined in section 5.7):
-1. Execute: `UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now() WHERE id = :turn_id AND state = 'running'`. If `rows_affected = 0`, another finalizer already completed this turn — skip to step 4 (metric only).
-2. Commit a bounded best-effort quota debit for the turn (same rule as cancel/disconnect: debit the reserved estimate).
-3. Insert a `modkit_outbox_events` row with `outcome = "aborted"`, `settlement_method = "estimated"` (see section 5.7 turn finalization contract). The orphan watchdog uses billing outcome `"aborted"` (not `"failed"`) because the stream ended without a provider-issued terminal event — consistent with the ABORTED billing state (section 5.8).
-4. Emit metric: `mini_chat_orphan_turn_total` (counter, labeled by `chat_id` excluded — use only low-cardinality labels such as `{reason}` where `reason` = `timeout`).
+A running turn is an orphan candidate only if its state is still `running`, `deleted_at IS NULL`, and its `last_progress_at` is older than the configured orphan timeout.
+
+Long-running turns with recent `last_progress_at` updates MUST NOT be classified as orphaned solely because `started_at` is old.
+
+**Action** (all steps in a single DB transaction, using the orphan-specific finalization CAS guard):
+1. The watchdog MAY discover orphan candidates using any equivalent stale-progress scan. Candidate discovery is advisory only and MUST NOT by itself authorize finalization.
+2. When the watchdog identifies a row as an orphan candidate by the stale-progress rule, emit `mini_chat_orphan_detected_total{reason="stale_progress"}`.
+3. Execute:
+   ```sql
+   UPDATE chat_turns
+      SET state = 'failed',
+          error_code = 'orphan_timeout',
+          completed_at = now(),
+          updated_at = now()
+    WHERE id = :turn_id
+      AND state = 'running'
+      AND deleted_at IS NULL
+      AND last_progress_at <= now() - interval '1 second' * :orphan_timeout_secs
+   ```
+4. If `rows_affected = 0`, the row is no longer orphan-finalizable (already finalized, soft-deleted, or progress was refreshed). The watchdog MUST skip quota settlement, outbox emission, and orphan-finalized metrics for that row.
+5. Only if `rows_affected = 1`, commit the bounded best-effort quota debit for the turn (same rule as cancel/disconnect: debit the reserved estimate).
+6. Only if `rows_affected = 1`, enqueue the corresponding Mini-Chat usage message with `outcome = "aborted"` and `settlement_method = "estimated"` (see section 5.7 turn finalization contract). The orphan watchdog uses billing outcome `"aborted"` (not `"failed"`) because the stream ended without a provider-issued terminal event — consistent with the ABORTED billing state (section 5.8).
+7. `mini_chat_orphan_finalized_total{reason="stale_progress"}` MUST be emitted only after this conditional update succeeds.
 
 **Scheduling**: the watchdog runs as a periodic task within the module (e.g. every 60 seconds). It MUST use leader election to ensure exactly one active watchdog instance per environment.
+
+Each watchdog scan SHOULD record `mini_chat_orphan_scan_duration_seconds`.
 
 ##### Watchdog Single-Actor Guarantee (P1 Mandatory)
 
@@ -3735,25 +3840,30 @@ The orphan watchdog MUST use ModKit's leader election primitive (or equivalent d
 orphan_watchdog:
   enabled: true
   scan_interval_secs: 60
-  timeout_threshold_secs: 300
+  timeout_secs: 300
 ```
 
 **Watchdog Invariants (P1 Mandatory MUST statements)**:
 
-1. **CAS Finalization Guard**: The watchdog MUST use the identical CAS finalization pattern as all other terminal paths:
+1. **Orphan Finalization Guard**: The watchdog MUST NOT finalize a turn solely because it matched an earlier scan. The terminal update itself MUST re-check all orphan-finalization predicates:
    ```sql
-   UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now()
-   WHERE id = :turn_id AND state = 'running'
+   UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now(), updated_at = now()
+   WHERE id = :turn_id
+     AND state = 'running'
+     AND deleted_at IS NULL
+     AND last_progress_at <= now() - interval '1 second' * :orphan_timeout_secs
    ```
-   If `rows_affected = 0`, the turn was already finalized by another path; the watchdog MUST skip it (no quota settlement, no outbox emission).
+   If `rows_affected = 0`, the turn was already finalized, soft-deleted, or made progress after candidate discovery; the watchdog MUST skip it (no quota settlement, no outbox emission, no orphan-finalized metric).
 
-2. **Idempotency**: The watchdog MUST be safe under retries and duplicate scans. The CAS guard ensures at-most-once finalization per turn. The outbox `dedupe_key` ensures at-most-once event emission.
+2. **Idempotency**: The watchdog MUST be safe under retries and duplicate scans. The CAS guard ensures at-most-once finalization per turn. The serialized usage payload MUST carry the stable billing idempotency key so downstream consumers can absorb duplicate deliveries produced by at-least-once outbox processing.
 
-3. **No Duplicate Outbox Rows**: The watchdog MUST rely on the outbox `dedupe_key` uniqueness constraint (`{tenant_id}/{turn_id}/{request_id}`) to prevent duplicate billing events. It MUST NOT implement separate deduplication logic.
+3. **No Duplicate Logical Billing Outcomes**: The watchdog MUST rely on the full orphan finalization guard — not just `state = 'running'` — to ensure that only one still-stale running turn can enqueue the logical billing event for that row. It MUST NOT implement a second, divergent finalization path.
 
-4. **No Terminal State Overwrites**: The watchdog MUST NOT transition a turn that is already in a terminal state (`completed`, `failed`, `cancelled`). The CAS guard (`WHERE state = 'running'`) enforces this; any watchdog logic that bypasses this guard is a correctness violation.
+4. **No False Orphan Finalization After Renewed Progress**: A turn whose `last_progress_at` was refreshed after candidate discovery MUST NOT be finalized by the watchdog. Any implementation that evaluates stale-progress only during scan, but not in the terminal conditional update, is a correctness violation.
 
-5. **Billing Outcome Consistency**: The watchdog MUST derive the outbox `outcome` field using the normative mapping in section 5.8 (Normative Billing Outcome Derivation). For orphan timeout, the mapping is: `state = 'failed'` + `error_code = 'orphan_timeout'` → billing outcome `ABORTED` → outbox `outcome = "aborted"`, `settlement_method = "estimated"`.
+5. **Billing Outcome Consistency**: The watchdog MUST derive the outbox payload `outcome` field using the normative mapping in section 5.8 (Normative Billing Outcome Derivation). For orphan timeout, the mapping is: `state = 'failed'` + `error_code = 'orphan_timeout'` → billing outcome `ABORTED` → outbox payload `outcome = "aborted"`, `settlement_method = "estimated"`.
+
+6. **Progress-Based Detection**: The watchdog MUST use durable stale-progress detection (`last_progress_at`) rather than raw age-from-start. That stale-progress predicate MUST participate both in candidate discovery and in the final conditional update. This timeout represents an infrastructure/liveness failure mode, not a provider-issued terminal failure.
 
 **Failure Mode**:
 - **Leader election failure**: Automatic re-election ensures continuity. Temporary scan delays (bounded by re-election time + orphan timeout) are acceptable; the system remains correct.
@@ -3778,7 +3888,7 @@ When replaying a `completed` turn for an existing `(chat_id, request_id)`, the s
 - Stream it back to the client as SSE events (delta + done)
 - **MUST NOT** take a new quota reserve
 - **MUST NOT** update `quota_usage` or debit tokens/credits
-- **MUST NOT** insert a new `modkit_outbox_events` row
+- **MUST NOT** enqueue a new outbox message
 - **MUST NOT** emit audit or billing events
 - **MUST NOT** call the LLM provider
 
@@ -3843,22 +3953,23 @@ When a chat is deleted:
 1. Soft-delete the chat record (`deleted_at` set)
 2. Mark all attachments for cleanup (`cleanup_status=pending`) and return immediately (no synchronous provider cleanup in the HTTP request)
 3. A background cleanup worker performs idempotent retries:
-  - For each attachment (documents and images): delete the provider file via OAGW using the internal `provider_file_id`, and update per-attachment cleanup state to a terminal status (`done` or `failed`) with retries/backoff
-  - Only after all attachments for the chat have reached a terminal cleanup status (`done`/`failed`), delete the chat's vector store via OAGW (single API call — simpler than per-file removal since the store is dedicated to the chat)
+  - For each attachment (documents and images): delete the provider file via OAGW using the internal `provider_file_id`, and update per-attachment cleanup state with retries/backoff
+  - Only after all attachments for the chat have reached cleanup status `done`, delete the chat's vector store via OAGW (single API call — simpler than per-file removal since the store is dedicated to the chat)
   - After successful vector store deletion (or provider 404 "already deleted"), delete the `chat_vector_stores` row
   - Cleanup worker rules:
     - Cleanup worker MUST treat "not found" / "already deleted" for vector store deletion as success
     - Cleanup worker MUST treat "already deleted" / "not found" for provider file deletion as success
     - Recommended order: delete provider files first, then delete the vector store, then delete the `chat_vector_stores` row
-    - If some attachments are marked `failed` after exhausting retries, they do not block vector store deletion; the vector store delete is still attempted once all attachments are terminal (`done`/`failed`)
+    - If some attachments are marked `failed` after exhausting retries, vector store deletion is NOT blocked — the worker proceeds once all attachment rows are terminal (`done` or `failed`). The chat MUST NOT be treated as fully purged from provider file storage until all individual file cleanup debt is resolved, but the vector store resource is released
+    - Because `failed` rows are terminal and excluded from automatic re-enqueue in P1, clearing per-file cleanup debt requires operator intervention or a future recovery policy outside P1 scope
 4. Partial failures are recorded per attachment (`cleanup_attempts`, `last_cleanup_error`) and retried with backoff
 5. (P2) Temporary chats will follow the same flow, triggered by a scheduled job after 24h
 
 **Vector store cleanup**: when a chat is deleted, the cleanup worker deletes the chat's entire vector store via OAGW (single API call). This is simpler than per-file removal since the store is dedicated to the chat. If the vector store has already been deleted (e.g., by the orphan reaper), treat as success.
 
-P1 operational requirement: run a periodic reconcile job (for example nightly) to reduce provider drift and manual cleanup.
+P1 operational requirement: run a periodic reconcile job according to `cleanup_worker.reconcile_interval_secs` to reduce provider drift and manual cleanup.
 
-- Re-enqueue attachment cleanup for rows stuck in `cleanup_status=pending` or for rows in `cleanup_status=in_progress` that have not been updated for longer than a configured timeout (worker crash recovery). Rows in terminal states (`done`, `failed`) are excluded.
+- Re-enqueue attachment cleanup only for rows in `cleanup_status=in_progress` whose parent chat is soft-deleted and whose `cleanup_updated_at` has exceeded `cleanup_worker.stale_in_progress_timeout_secs` (worker crash recovery). Rows in terminal states (`done`, `failed`) are excluded. `failed` rows remain unresolved per-file provider-cleanup debt but do not block vector store deletion. Clearing per-file debt requires operator intervention or a future recovery policy outside P1 scope because `failed` rows are not automatically re-enqueued.
 - Emit cleanup drift metrics (`mini_chat_cleanup_orphan_found_total`, `mini_chat_cleanup_orphan_fixed_total`) based on what can be detected from DB state and provider responses.
 
 ## 5. Quota Enforcement and Billing Integration
@@ -3876,8 +3987,8 @@ The overall scheme:
 - CCM publishes versioned policy snapshots: models (credit multipliers), per-user limits in credits for day/month (P1).
 - Mini-chat applies the snapshot at the turn boundary and stores `policy_version` in `chat_turn`.
 - Mini-chat reserves worst-case credits and checks day/month limits locally, without CCM RPC.
-- After the response, mini-chat commits actual credits and writes a usage event to the transactional outbox.
-- A background dispatcher publishes usage events via the selected `mini-chat-model-policy-plugin` plugin (`publish_usage(payload)`).
+- After the response, mini-chat commits actual credits and enqueues a usage message through the transactional outbox.
+- A decoupled outbox handler publishes usage messages via the selected `mini-chat-model-policy-plugin` plugin (`publish_usage(payload)`).
 - CCM consumes usage events and updates the balance.
 
 The user has **a single wallet of credits specifically for chat**. Per-tier limits are nested caps, enforced via bucket rows in `quota_usage` (section 3.7):
@@ -3912,7 +4023,7 @@ Why the version matters:
 Minimum places to persist the applied version (P1):
 
 - `chat_turn.policy_version_applied`
-- `modkit_outbox_events.payload.policy_version_applied` (as part of the outbox payload/event)
+- serialized Mini-Chat outbox usage payload `policy_version_applied`
 
 Contents (logically):
 
@@ -4602,7 +4713,7 @@ If the LLM crashed or was cancelled:
   - if the provider was called and usage was returned — debit actual, `settlement_method = "actual"`
   - if unknown (orphan, disconnect, crash) — debit bounded estimate using `min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)`, `settlement_method = "estimated"`
 
-- The orphan watchdog (P1 mandatory) MUST detect turns stuck in `running` state beyond a configurable timeout (default: 5 min) and finalize them using the same CAS guard and the deterministic formula above. The watchdog MUST write the quota settlement and the `modkit_outbox_events` row in the same DB transaction.
+- The orphan watchdog (P1 mandatory) MUST detect turns stuck in `running` state beyond a configurable timeout (default: 5 min) and finalize them using the same CAS guard and the deterministic formula above. The watchdog MUST write the quota settlement and enqueue the corresponding Mini-Chat usage message in the same DB transaction.
 
 Important: this MUST be deterministic, recorded, and use the identical CAS-guarded finalization path as all other terminal triggers.
 
@@ -5006,8 +5117,8 @@ Thus we achieve:
 4. Reserve is computed in credits.
 5. Reserve > Settlement never produces negative limits.
 6. policy_version is fixed on the turn.
-7. **Replay is side-effect-free**: when a completed turn is replayed for the same `(chat_id, request_id)`, the system MUST NOT take a new quota reserve, MUST NOT update `quota_usage` or debit credits, MUST NOT insert a new outbox row, and MUST NOT emit audit or billing events. Replay is a pure read-and-relay operation.
-8. **Outbox emission is atomic with settlement**: the CAS-guarded finalization transaction MUST include the outbox row insert (`modkit_outbox_events`) in the same DB transaction as quota settlement. It MUST be impossible for quota to be debited without a corresponding outbox row.
+7. **Replay is side-effect-free**: when a completed turn is replayed for the same `(chat_id, request_id)`, the system MUST NOT take a new quota reserve, MUST NOT update `quota_usage` or debit credits, MUST NOT enqueue a new outbox message, and MUST NOT emit audit or billing events. Replay is a pure read-and-relay operation.
+8. **Outbox emission is atomic with settlement**: the CAS-guarded finalization transaction MUST include the Mini-Chat outbox enqueue in the same DB transaction as quota settlement. It MUST be impossible for quota to be debited without a corresponding outbox message being durably enqueued.
 9. **Orphan watchdog is P1 mandatory**: a periodic background job MUST detect turns stuck in `running` state beyond a configurable timeout (default: 5 min) and finalize them with a bounded best-effort debit using the same CAS guard, quota settlement, and outbox emission as all other finalization paths. The watchdog ensures no turn can permanently evade billing. See `cpt-cf-mini-chat-component-orphan-watchdog`.
 
 #### 5.5.13 Deterministic Reserve and Settlement Model
@@ -5081,12 +5192,18 @@ Where `in_mult` and `out_mult` are read from the policy snapshot identified by `
 
 **Solution**: use a transactional outbox to guarantee at-least-once event delivery without introducing synchronous billing calls in the hot path.
 
-**Outbox storage**: Mini-Chat usage events are stored in the shared infrastructure table `modkit_outbox_events` owned by `modkit-db`. See [outbox-pattern.md](features/outbox-pattern.md) section 1.6 for the canonical table schema, column definitions, and indexes.
+**Shared outbox implementation**: Mini-Chat uses the shared `modkit_db::outbox` subsystem implemented in `libs/modkit-db/src/outbox`. The authoritative integration surface is:
 
-Mini-Chat usage events use:
-- `namespace = "mini-chat"`
-- `topic = "usage_snapshot"`
-- `dedupe_key` — **canonical format (normative)**: `"{tenant_id}/{turn_id}/{request_id}"` where all three components are UUID hex strings (32 lowercase hexadecimal characters, no hyphens or braces). This is the sole stable idempotency key for Mini-Chat outbox events. No other format is permitted.
+- `Outbox::enqueue(...)` / `Outbox::enqueue_batch(...)` for producers
+- `OutboxBuilder` / `QueueBuilder` for queue registration and worker startup
+- `HandlerResult::{Success, Retry, Reject}` for decoupled processing outcomes
+- `dead_letter_*` operations for operator recovery of rejected messages
+
+Mini-Chat usage publication uses:
+- a dedicated Mini-Chat usage queue registered at startup (exact queue name is implementation-defined in P1)
+- a stable `payload_type` identifying the usage payload schema/version
+- `event_type = "usage_snapshot"` inside the serialized payload
+- `dedupe_key` — **canonical format (normative)**: `"{tenant_id}/{turn_id}/{request_id}"` where all three components are UUID hex strings (32 lowercase hexadecimal characters, no hyphens or braces). This is the sole stable idempotency key for Mini-Chat usage payloads. No other format is permitted.
 
 > Where:
 >
@@ -5122,134 +5239,51 @@ fn construct_dedupe_key(tenant_id: Uuid, turn_id: Uuid, request_id: Uuid) -> Str
 ```
 
 **Application points:**
-- MUST be applied when constructing `dedupe_key` for outbox events
-- MUST be applied when extracting tenant_id from dedupe_key for downstream idempotency checks
+- MUST be applied when constructing `dedupe_key` for Mini-Chat usage payloads
+- MUST be applied when extracting tenant_id from `dedupe_key` for downstream idempotency checks
 - MUST NOT be applied to API request/response serialization (use hyphenated RFC 4122 format)
 - MUST NOT be applied to database queries (Postgres uses native UUID type)
 
 **Rationale:** The 32-char hex format eliminates parsing ambiguity and reduces dedupe_key length (96 chars vs 114 chars for three hyphenated UUIDs + two slashes).
 
-- `payload` (JSONB): contains all mini-chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
+- the serialized JSON payload, which contains all Mini-Chat-specific fields (`tenant_id`, `user_id`, `chat_id`, `turn_id`, `request_id`, `effective_model`, `selected_model`, `policy_version_applied`, `usage`, `outcome`, `settlement_method`, etc.)
 
-**Dedupe / unique constraint**: the partial unique index `(namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL` on `modkit_outbox_events` enforces at most one outbox event per turn invocation at the database level. All finalizers MUST insert the outbox row within the same transaction as the guarded state transition (CAS on `chat_turns.state = 'running'`, section 5.7) and quota settlement.
+**Producer-side uniqueness (normative)**: the shared outbox library treats payloads as opaque bytes and does not enforce a Mini-Chat-specific `(namespace, topic, dedupe_key)` uniqueness rule. Exactly one logical enqueue per turn MUST therefore be achieved by the domain-side CAS winner in `chat_turns` finalization (section 5.7) or by the authoritative system-task terminal transition for background work. The serialized payload MUST still carry stable dedupe identifiers so downstream consumers can absorb duplicate deliveries caused by at-least-once processing.
 
-**Initial row state (normative)**: outbox rows MUST be inserted with `status = 'pending'`, `attempts = 0`, `next_attempt_at = now()` (eligible for immediate dispatch), `locked_by = NULL`, `locked_until = NULL`. The `attempts` column MUST start at `0` so that the first claim increment produces `attempts = 1` and the first retry backoff is `min(2^1 * base_delay, max_delay)`. Inserting with `attempts = 1` would shift the entire backoff curve by one step and is incorrect.
+**Transactional rule**: the quota usage commit (updating `quota_usage` bucket rows) and the outbox enqueue MUST happen in the same database transaction. If either fails, the entire transaction rolls back. `Outbox::transaction(...)` MAY be used as a helper, but it is not semantically required. This guarantees that every committed quota change has a corresponding durably enqueued message.
 
-**Conflict semantics (normative)**: the outbox INSERT MUST use `INSERT ... ON CONFLICT (namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING` (or the equivalent ORM upsert-ignore). If the INSERT returns zero rows affected (dedupe conflict), the finalizer MUST treat the event as already emitted and MUST NOT re-emit. The finalizer MUST NOT raise an error to the caller on dedupe conflict — the duplicate is a normal idempotency outcome, not an error condition.
+#### Shared Outbox Processing Model (P1)
 
-**Transactional rule**: the quota usage commit (updating `quota_usage` bucket rows) and the outbox row insert MUST happen in the same database transaction. If either fails, the entire transaction rolls back. This guarantees that every committed quota change has a corresponding pending event.
+Mini-Chat MUST use the shared outbox pipeline rather than implementing its own SQL dispatcher over the shared outbox storage.
 
-**Dispatcher worker**: a background dispatcher (ModKit `stateful` lifecycle task) polls `modkit_outbox_events` rows where `status = 'pending'` and `next_attempt_at <= now()`, filtered by `namespace = 'mini-chat'`, ordered by `created_at`. For each row:
+**Usage publication handler**:
 
-1. Publish the event to the selected `mini-chat-model-policy-plugin` plugin via `publish_usage(payload)`.
-2. On success, set `status = 'delivered'` and update `updated_at`.
-3. On transient failure, increment `attempts`, set `next_attempt_at` with exponential backoff: `now() + min(2^attempts * base_delay, max_delay)`, keep `status = 'pending'`.
+1. Mini-Chat registers a decoupled outbox handler for usage-publication messages. External plugin calls such as `publish_usage(payload)` MUST use `decoupled` mode, not `transactional`, because the side effect happens outside the database.
+2. The handler receives `OutboxMessage { payload, payload_type, attempts, ... }` from the shared outbox queue.
+3. On success, the handler returns `HandlerResult::Success`.
+4. On transient failure, the handler returns `HandlerResult::Retry { reason }`. Retry backoff, lease handling, reclaim, partition concurrency, sequencer wake-up, and vacuum are then handled by `modkit-db::outbox` using the queue registration settings.
+5. On permanent poison-message failure, the handler returns `HandlerResult::Reject { reason }`. The shared outbox moves the message to its dead-letter store. Operators recover via `dead_letter_*` APIs; Mini-Chat does not define a separate `dead` row state.
 
-> Where:
->
-> * `base_delay` — base retry delay in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.base_delay_seconds` (integer). Default value: `2`. MUST be validated at startup: `1 <= base_delay_seconds <= 60`.
-> * `max_delay` — maximum retry delay cap in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_delay_seconds` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `base_delay_seconds <= max_delay_seconds <= 3600`.
-> * `now()` — current database server time (UTC)
-> * **Transient failure classification (P1 normative)**: The following error classes MUST be treated as transient (retried with exponential backoff):
->   - Connection-level: TCP timeout, connection refused, DNS resolution failure
->   - HTTP 408 (Request Timeout), HTTP 429 (Too Many Requests), HTTP 5xx (all server-side errors)
->
->   The following MUST be treated as immediately permanent (skip retry backoff, transition directly to `status = 'dead'`):
->   - HTTP 400, 401, 403, 404, 410, 422 — client errors indicating the request is structurally invalid or permanently rejected by the plugin; retrying will not succeed.
->
->   All other error classes default to transient until `max_attempts` is exhausted.
+**Queue configuration ownership**:
 
-4. On permanent failure (attempts exceed configured max), set `status = 'dead'` and emit an alert metric.
+- Retry/lease semantics are controlled by the shared outbox queue configuration (`lease_duration`, `backoff_base`, `backoff_max`, `max_concurrent_partitions`, `msg_batch_size`) at queue-registration time.
+- Global sequencer/vacuum cadence is controlled by the shared outbox builder configuration (`sequencer_batch_size`, `poll_interval`, `vacuum_cooldown`).
+- Mini-Chat MUST NOT re-specify those mechanics as per-row status transitions in this document.
 
-> Where:
->
-> * `configured max` — maximum retry attempts before dead-lettering. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_attempts` (integer). Default value: `10`. MUST be validated at startup: `3 <= max_attempts <= 100`.
-> * **Permanent failure classification (P1)**: `attempts > max_attempts` (retry exhaustion). Additional permanent error codes (e.g., HTTP 4xx indicating client error, explicit plugin rejection) MAY be added in future revisions but are not required in P1. When `status = 'dead'`, emit metric `mini_chat_outbox_dead_total` (counter, labels: `{namespace, topic}`).
+**Idempotency rule**: consumers (CyberChatManager) MUST deduplicate usage events by the stable logical identity carried in the serialized payload:
 
-#### Outbox Dispatcher Concurrency and Row Claiming (P1)
+- user turns: `(tenant_id, turn_id, request_id)` or the equivalent `dedupe_key`
+- system tasks: `(tenant_id, system_task_type, system_request_id)` or the equivalent `dedupe_key`
 
-At-least-once delivery is allowed; duplicates are possible (see Idempotency rule below). However, dispatchers MUST implement a row-claiming mechanism to minimize duplicate publishes under multi-pod concurrency. A dispatcher MUST NOT publish an outbox row unless it has atomically claimed it.
-
-**Row-claiming algorithm (Postgres)**:
-
-1. **Claim transaction** — within a single DB transaction:
-
-   ```sql
-   -- Step 1: select and lock unclaimed pending rows
-   SELECT id, payload, namespace, topic, tenant_id, dedupe_key
-   FROM modkit_outbox_events
-   WHERE namespace = 'mini-chat'
-     AND status = 'pending'
-     AND next_attempt_at <= now()
-   ORDER BY created_at
-   LIMIT :batch_size
-   FOR UPDATE SKIP LOCKED;
-
-   -- Step 2: atomically mark selected rows as processing
-   UPDATE modkit_outbox_events
-   SET status = 'processing',
-       locked_by = :worker_id,
-       locked_until = now() + :lease_duration,
-       attempts = attempts + 1,
-       updated_at = now()
-   WHERE id = ANY(:selected_ids);
-   ```
-
-   `FOR UPDATE SKIP LOCKED` ensures that concurrent dispatchers never select the same rows. Commit the claim transaction before proceeding to publish.
-
-2. **Publish** — outside the claim transaction, publish each claimed event to the selected `mini-chat-model-policy-plugin` plugin.
-
-3. **On success** — update the row:
-
-   ```sql
-   UPDATE modkit_outbox_events
-   SET status = 'delivered',
-       updated_at = now()
-   WHERE id = :row_id AND status = 'processing';
-   ```
-
-   `delivered` is a terminal status; the row MUST NOT be modified further by any dispatcher.
-
-4. **On failure** — update the row:
-
-   ```sql
-   UPDATE modkit_outbox_events
-   SET status = 'pending',
-       locked_by = NULL,
-       locked_until = NULL,
-       next_attempt_at = now() + least(2 ^ attempts * :base_delay, :max_delay),
-       last_error = :sanitized_error,
-       updated_at = now()
-   WHERE id = :row_id AND status = 'processing';
-   ```
-
-   `last_error` MUST be sanitized to avoid provider identifier leakage (same redaction rules as audit events).
-
-**Lease expiry reclaim rule**: if `now() > locked_until` and `status = 'processing'`, any dispatcher MAY reclaim the row by transitioning it back to `pending` (setting `locked_by = NULL`, `locked_until = NULL`). This handles the case where the claiming dispatcher crashes after the claim transaction but before publishing. **`attempts` MUST NOT be incremented during reclaim** — the count was already incremented when the row was originally claimed in step 2 above. Incrementing again on reclaim would over-count attempts and apply more aggressive exponential backoff than intended, risking premature dead-lettering on rows where the original dispatcher silently crashed.
-
-**State transition invariant**: a row transitions `pending → processing → delivered` monotonically. `delivered` is terminal. The only non-forward transition is `processing → pending` on publish failure or lease expiry, which allows retry. A row MUST NOT transition from `delivered` to any other status. Rows that exhaust `max_attempts` transition to `dead` (terminal).
-
-**Crash safety**: the dispatcher MUST be safe under crashes at any point:
-
-- **Crash before claim commit**: no row is claimed; no side effects.
-- **Crash after claim commit but before publish**: the row remains `processing` until `locked_until` expires, then becomes reclaimable by another dispatcher.
-- **Crash after publish but before marking `delivered`**: the row remains `processing`, expires, and may be re-published. Consumer deduplication by `(tenant_id, turn_id, request_id)` absorbs the duplicate.
-
-**Operational guidance (P1 minimum)**:
-
-- Dispatchers MUST use bounded retries: after `max_attempts` (configurable, default: 10) consecutive failures, set `status = 'dead'` and emit the `mini_chat_outbox_dead_total` alert metric.
-- Dispatchers MUST expose observability counters: `mini_chat_outbox_claimed_total`, `mini_chat_outbox_sent_total`, `mini_chat_outbox_dead_total`, `mini_chat_outbox_lease_expired_total`.
-- Batch size, retry base delay, max delay, and lease duration are deployment-configurable. Specific default values are deferred to P2+ operational runbooks.
-
-**Idempotency rule**: consumers (CyberChatManager) MUST deduplicate events by `(tenant_id, turn_id, request_id)`. At-least-once delivery means duplicates are possible; the consumer is responsible for ignoring replayed events.
+At-least-once delivery means duplicates are possible; the consumer is responsible for ignoring replayed deliveries of the same logical event.
 
 **Failure modes**:
 
-- **Plugin unavailable**: outbox rows accumulate in `pending` status. The dispatcher retries with backoff. No data is lost; delivery resumes when the plugin recovers.
-- **Duplicate publish**: the dispatcher may re-publish a row if it crashes after sending but before marking `delivered`. The consumer deduplicates using the idempotency key `(tenant_id, turn_id, request_id)` from the `dedupe_key`.
-- **Permanent failures**: rows in `dead` status trigger an alert via `mini_chat_outbox_dead_total` metric. Operators investigate and may replay manually or fix the root cause.
+- **Plugin unavailable**: the decoupled handler returns `Retry`; the shared outbox re-delivers according to queue backoff/lease semantics. No committed quota data is lost.
+- **Duplicate publish**: the handler may publish twice if the worker crashes after the external side effect but before the shared outbox records success. Downstream deduplication by the serialized idempotency key absorbs the duplicate.
+- **Permanent failures**: rejected messages accumulate in the shared outbox dead-letter store and MUST trigger Mini-Chat operational alerts.
 
-**Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls. The canonical outbox table schema and API are defined in [outbox-pattern.md](features/outbox-pattern.md). Detailed event payload schemas and envelope definitions remain deferred to P2+ (see section 5.6).
+**Scope**: the outbox mechanism is P1 mandatory — it is required for billing event completeness and MUST be implemented before any production deployment that processes quota-bearing turns. It is an internal reliability pattern that does not change any external API contract or introduce synchronous billing calls.
 
 ### 5.7 Turn Finalization Contract (P1): Quota Settlement and Outbox Emission
 
@@ -5273,10 +5307,10 @@ Note: "disconnected" is not a separate internal state. Client disconnects are de
 
 #### Settlement transaction invariant
 
-For any outcome where the server applies a quota debit (actual or estimated), the system MUST write the corresponding outbox row in the same DB transaction as the quota settlement. This is the core invariant that prevents billing drift.
+For any outcome where the server applies a quota debit (actual or estimated), the system MUST enqueue the corresponding Mini-Chat outbox message in the same DB transaction as the quota settlement. This is the core invariant that prevents billing drift.
 
-- Quota settlement (reserve release or commit of actual/estimated usage) and outbox INSERT MUST be atomic within one DB transaction.
-- Outbox uniqueness is enforced via `dedupe_key = "{tenant_id}/{turn_id}/{request_id}"` within `(namespace, topic, dedupe_key)` partial unique index on `modkit_outbox_events`.
+- Quota settlement (reserve release or commit of actual/estimated usage) and outbox enqueue MUST be atomic within one DB transaction.
+- The serialized usage payload MUST carry `dedupe_key = "{tenant_id}/{turn_id}/{request_id}"`.
 - Consumer deduplication remains by `(tenant_id, turn_id, request_id)`.
 
 #### Reserve persistence prerequisite
@@ -5298,11 +5332,11 @@ Deterministic reconciliation for `ABORTED` and post-provider-start `FAILED` outc
 
 #### Dedupe Key Requirement for Quota-Bearing Events (Normative)
 
-**Problem:** The generic outbox library allows `dedupe_key` to be NULL (enforced only by partial unique index), but billing/quota-bearing events MUST be idempotent and MUST have non-null `dedupe_key` for at-least-once delivery semantics without duplicate charges.
+**Problem:** The shared outbox library provides at-least-once delivery and treats Mini-Chat payloads as opaque bytes. Billing/quota-bearing events therefore MUST carry a stable, non-null domain-level `dedupe_key` inside the serialized payload so downstream consumers can suppress duplicate deliveries without duplicate charges.
 
 **Rule:**
 
-- **Quota-bearing events** (all events in `usage_snapshot` topic that result in quota debit or credit) MUST have non-null `dedupe_key`
+- **Quota-bearing events** (all `usage_snapshot` messages that result in quota debit or credit) MUST have non-null `dedupe_key`
 - **Non-quota-bearing events** (e.g., informational telemetry, system notifications) MAY have NULL `dedupe_key` if idempotency is not required
 
 **Mini-Chat application:**
@@ -5320,10 +5354,10 @@ Where:
 
 **Enforcement layers:**
 
-1. **Generic outbox library (`modkit_db::outbox`):**
-   - Accepts NULL `dedupe_key` (backward compatible with non-billing use cases)
-   - Enforces at-most-once for non-NULL dedupe_key via partial unique index
-   - DOES NOT validate Mini-Chat-specific format
+1. **Shared outbox library (`modkit_db::outbox`):**
+   - Treats Mini-Chat payloads as opaque bytes
+   - Delivers them at-least-once through the configured queue/handler pipeline
+   - DOES NOT validate Mini-Chat-specific `dedupe_key` format
 
 2. **Mini-Chat domain layer (quota settlement code):**
    - MUST validate that `dedupe_key` is non-null and well-formed BEFORE calling `enqueue`
@@ -5333,11 +5367,10 @@ Where:
 **Rationale:**
 
 Billing correctness depends on idempotent event delivery. If `dedupe_key` is NULL:
-- The partial unique index does not prevent duplicate inserts
 - Downstream consumers cannot deduplicate based on turn identity
 - Retry/replay scenarios could result in double-charging
 
-By requiring non-null `dedupe_key` for quota-bearing events at the domain layer, we enforce billing idempotency while keeping the generic outbox library flexible for other use cases.
+By requiring non-null `dedupe_key` for quota-bearing events at the domain layer, we enforce billing idempotency while keeping the shared outbox library generic.
 
 **Error handling:**
 
@@ -5355,7 +5388,7 @@ This error MUST be logged as CRITICAL and MUST prevent the transaction from comm
 
 #### Outbox Enqueue Validation (Mini-Chat Domain Layer)
 
-When Mini-Chat code calls `modkit_db::outbox::enqueue`, it MUST validate the consistency of `tenant_id` and `dedupe_key` BEFORE the call:
+When Mini-Chat code calls `modkit_db::outbox::enqueue`, it MUST validate the consistency of `tenant_id` and `dedupe_key` BEFORE serializing and enqueuing the message:
 
 ```rust
 fn validate_outbox_message(tenant_id: Uuid, dedupe_key: &str) -> Result<()> {
@@ -5400,9 +5433,9 @@ WHERE id = :turn_id AND state = 'running'
 
 - **`rows_affected = 1`**: this finalizer won the CAS race. It is the ONLY actor allowed to:
   (a) settle quota (release unused reserve or commit actual/estimated usage),
-  (b) insert the `modkit_outbox_events` row, and
+  (b) enqueue the corresponding Mini-Chat outbox message, and
   (c) persist the final assistant message content (if the outcome is `completed`).
-  All three operations — CAS state transition, quota settlement, and outbox insert — MUST be within one DB transaction.
+  All three operations — CAS state transition, quota settlement, and outbox enqueue — MUST be within one DB transaction.
 - **`rows_affected = 0`**: another finalizer already transitioned the turn. This finalizer MUST treat the turn as already finalized, MUST NOT debit quota, MUST NOT emit an outbox event, and MUST stop processing. It is an idempotent no-op.
 
 No finalization path is exempt from this guard. The orphan watchdog uses the identical CAS pattern (`WHERE state = 'running'`) and cannot "finalize late" if the stream already completed or was already finalized by another path.
@@ -5426,7 +5459,7 @@ When the provider returns terminal data (`done` or `error` event):
    ```
 3. **Check `rows_affected` and gate SSE emission**:
    - **If `rows_affected = 1`** (CAS winner):
-     - Proceed with quota settlement and outbox insertion within the same transaction
+     - Proceed with quota settlement and outbox enqueue within the same transaction
      - Commit the transaction
      - **Only after successful commit**: emit the terminal SSE event (`done` or `error`) to the client
      - Flush and close the SSE stream
@@ -5467,7 +5500,7 @@ Without this guard, the SSE stream and the database state can become inconsisten
 The following patterns are explicitly prohibited. Any implementation that matches these patterns is a correctness violation:
 
 1. **"Update messages first, update turn state later"** — FORBIDDEN. The assistant message persistence and the turn state transition MUST be ordered such that a `completed` state is never observable without the corresponding durable message content.
-2. **"Outbox insert outside the finalization transaction"** — FORBIDDEN. The outbox row MUST be inserted within the same DB transaction as the CAS state transition and quota settlement. A separate transaction risks duplicate or orphaned billing events.
+2. **"Outbox enqueue outside the finalization transaction"** — FORBIDDEN. The outbox message MUST be enqueued within the same DB transaction as the CAS state transition and quota settlement. A separate transaction risks duplicate or orphaned billing events.
 3. **"Watchdog finalizes without checking running state"** — FORBIDDEN. The watchdog MUST use the identical `WHERE state = 'running'` CAS guard. A watchdog that unconditionally overwrites terminal states corrupts already-settled turns.
 
 #### User message persistence invariant (preflight prerequisite)
@@ -5534,15 +5567,15 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 
 Three subcases:
 
-- **failed_pre_reserve**: error before a quota reserve is taken (validation error, authorization denial, quota preflight rejection — no `chat_turns` row with a reserve exists). No settlement occurs and no quota debit applies. Emitting a `modkit_outbox_events` row is OPTIONAL (the "exactly one event per reserve" invariant does not apply because no reserve was created). If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`.
-- **failed_post_reserve_pre_provider**: a quota reserve was taken (the `chat_turns` row entered `IN_PROGRESS`) but the provider request was NOT issued (e.g., context assembly error, internal timeout, transient infrastructure failure between successful preflight and the outbound call). The reserve MUST be fully released (`charged_tokens = 0`). A `modkit_outbox_events` row MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant. The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction.
-- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied`. Emit outbox event with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
+- **failed_pre_reserve**: error before a quota reserve is taken (validation error, authorization denial, quota preflight rejection — no `chat_turns` row with a reserve exists). No settlement occurs and no quota debit applies. Emitting an outbox message is OPTIONAL (the "exactly one event per reserve" invariant does not apply because no reserve was created). If the system does emit one for observability, the payload MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`.
+- **failed_post_reserve_pre_provider**: a quota reserve was taken (the `chat_turns` row entered `IN_PROGRESS`) but the provider request was NOT issued (e.g., context assembly error, internal timeout, transient infrastructure failure between successful preflight and the outbound call). The reserve MUST be fully released (`charged_tokens = 0`). A Mini-Chat outbox message MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant. The reserve release, `chat_turns` state transition to `failed`, and outbox enqueue MUST occur in a single atomic DB transaction.
+- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied`. Emit the outbox message with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
 
 **3) aborted** (client disconnect / pod crash / orphan watchdog / internal abort):
 
 - If provider usage is known (provider sent a partial usage report before the stream ended), settle on actual usage. **"Usage known" requires a `usage` object with at least one non-zero field** (`input_tokens > 0` OR `output_tokens > 0`). A `usage` object present with both fields equal to zero (or missing) is treated as "usage unknown" and MUST follow the estimated path — not the actual path. This prevents zero-charge exploitation: the no-free-cancel rule (§5.4 Settlement Definitions) mandates a non-zero debit whenever the provider request started; the estimated path enforces this via `minimal_generation_floor_applied`.
 - Otherwise settle using the deterministic charged token formula: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor_applied)` where `minimal_generation_floor_applied` is read from `chat_turns.minimal_generation_floor_applied` (persisted at preflight from MiniChat ConfigMap, immutable after insert), consistent with the cancel/disconnect rule (see section 3.2) and the aborted-stream reconciliation (section 5.8).
-- Emit outbox event with `outcome = "aborted"`, `settlement_method = "actual"` or `"estimated"`.
+- Emit the outbox message with `outcome = "aborted"`, `settlement_method = "actual"` or `"estimated"`.
 
 #### Reconciliation backstop
 
@@ -5737,10 +5770,10 @@ The mapping table uses `error_code` values as predicates to classify pre-provide
 
 **Enforcement**:
 - This mapping MUST be implemented in a **single shared function** used by ALL finalization code paths: normal completion handler, error handler, disconnect/cancellation handler, and orphan watchdog.
-- EVERY terminal code path MUST call this function to derive the outbox payload; no path may construct outbox rows using ad-hoc logic.
+- EVERY terminal code path MUST call this function to derive the outbox payload; no path may construct ad-hoc billing messages with divergent semantics.
 - Unit tests MUST verify that each internal condition row in the table above produces the exact `outcome` and `settlement_method` specified.
 
-**Watchdog determinism rule**: the orphan turn watchdog (section 3, `cpt-cf-mini-chat-component-orphan-watchdog`) MUST use the exact same deterministic charged token formula defined below for `ABORTED` streams — no separate estimation path. The watchdog MUST perform (1) quota settlement using the formula, (2) `chat_turns` state transition, and (3) `modkit_outbox_events` insertion in a single atomic DB transaction. It MUST be impossible for a turn to remain in `IN_PROGRESS` indefinitely; the watchdog timeout (default: 5 minutes) is the hard upper bound on turn duration without a terminal provider event.
+**Watchdog determinism rule**: the orphan turn watchdog (section 3, `cpt-cf-mini-chat-component-orphan-watchdog`) MUST use the exact same deterministic charged token formula defined below for `ABORTED` streams — no separate estimation path. The watchdog MUST perform (1) quota settlement using the formula, (2) `chat_turns` state transition, and (3) outbox enqueue in a single atomic DB transaction. It MUST be impossible for a turn to remain in `IN_PROGRESS` indefinitely; the watchdog timeout (default: 5 minutes) is the hard upper bound on turn duration without a terminal provider event.
 
 #### Deterministic Charged Token Formula (Aborted Streams)
 
@@ -5773,7 +5806,7 @@ The formula is deliberately conservative (charges less than or equal to the rese
 
 #### Outbox Emission Requirement (Aborted Streams)
 
-When a turn transitions to `ABORTED`, the system MUST emit a `modkit_outbox_events` row with:
+When a turn transitions to `ABORTED`, the system MUST emit a Mini-Chat outbox message whose serialized payload contains:
 
 | Field | Value |
 |-------|-------|
@@ -5790,7 +5823,7 @@ When a turn transitions to `ABORTED`, the system MUST emit a `modkit_outbox_even
 | `quota_decision`, `downgrade_from`, `downgrade_reason` | If applicable |
 | `turn_id`, `request_id`, `chat_id`, `tenant_id`, `user_id` | Standard identifiers |
 
-This outbox row MUST be written in the **same DB transaction** as the quota settlement and `chat_turns` state transition (consistent with the settlement transaction invariant in section 5.7).
+This outbox message MUST be enqueued in the **same DB transaction** as the quota settlement and `chat_turns` state transition (consistent with the settlement transaction invariant in section 5.7).
 
 #### Billing Event Completeness Invariant
 
@@ -5808,7 +5841,7 @@ CyberChatManager MUST receive exactly one usage event for every turn that took a
 - `outcome`: `"completed"`, `"failed"`, `"aborted"`
 - `settlement_method`: `"actual"`, `"estimated"`, `"released"`
 
-**Invariant**: it MUST be impossible for `quota_usage` to be debited without a corresponding `modkit_outbox_events` row. The transactional atomicity guarantee (sections 5.6 and 5.7) applies to all billing states that hold a reserve (COMPLETED, FAILED post-reserve, ABORTED). If the transaction fails, neither the quota debit nor the outbox row is committed.
+**Invariant**: it MUST be impossible for `quota_usage` to be debited without a corresponding Mini-Chat outbox message being durably enqueued. The transactional atomicity guarantee (sections 5.6 and 5.7) applies to all billing states that hold a reserve (COMPLETED, FAILED post-reserve, ABORTED). If the transaction fails, neither the quota debit nor the outbox message is committed.
 
 #### Pre-Provider Failure Handling
 
@@ -5816,8 +5849,8 @@ If a failure occurs AFTER a quota reserve was taken but BEFORE the provider requ
 
 - The reserve MUST be fully released (`charged_tokens = 0`).
 - `settlement_method` MUST be `"released"`.
-- A `modkit_outbox_events` row MUST still be emitted with `outcome = "failed"` and `usage = { input_tokens: 0, output_tokens: 0 }` to preserve the exactly-once billing event invariant. CyberChatManager receives a zero-charge event rather than no event.
-- The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction.
+- A Mini-Chat outbox message MUST still be emitted with `outcome = "failed"` and `usage = { input_tokens: 0, output_tokens: 0 }` to preserve the exactly-once billing event invariant. CyberChatManager receives a zero-charge event rather than no event.
+- The reserve release, `chat_turns` state transition to `failed`, and outbox enqueue MUST occur in a single atomic DB transaction.
 
 This eliminates the ambiguity between "reserve taken, provider not called" and "reserve taken, provider called, stream aborted". The former always settles at zero with `settlement_method = "released"`; the latter uses the deterministic charged token formula with `settlement_method = "estimated"`.
 
@@ -5843,7 +5876,7 @@ Section 5.7 defines the `failed` outcome taxonomy (pre-provider vs. post-provide
 **A) Failure before reserve is taken** (validation error, authorization denial, quota preflight rejection — i.e., the failure occurs before or during preflight, so no `chat_turns` row with a reserve exists):
 
 - No quota settlement occurs (there is no reserve to release).
-- Emitting a `modkit_outbox_events` row is OPTIONAL. The "exactly one event per reserve" invariant does not apply because no reserve was created. If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST use a stable `dedupe_key` derived from `(tenant_id, turn_id, request_id)` so that consumers can safely ignore duplicates.
+- Emitting an outbox message is OPTIONAL. The "exactly one event per reserve" invariant does not apply because no reserve was created. If the system does emit one for observability, the payload MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST use a stable `dedupe_key` derived from `(tenant_id, turn_id, request_id)` so that consumers can safely ignore duplicates.
 
 > **turn_id generation for pre-reserve failures**: if no `chat_turns` row exists (failure during validation or authorization before INSERT), the implementation MUST either (1) not emit an outbox event (OPTIONAL branch) or (2) use the **all-zeros sentinel UUID** (`00000000-0000-0000-0000-000000000000`) as the `turn_id` component of the dedupe_key. Using a per-invocation random UUID v4 as `turn_id` is **PROHIBITED**: client retries generate new random UUIDs per attempt, producing a different `dedupe_key` for each retry of the same logical request — defeating idempotency and allowing duplicate pre-reserve events. The sentinel `turn_id` is stable across retries of the same `request_id`. Dedupe key format: `{tenant_id_hex}/00000000000000000000000000000000/{request_id_hex}` (all UUIDs normalized to lowercase 32-char hex). The `request_id` is always available (client-provided or server-generated per standard turn semantics). The `tenant_id` is available from the authenticated request context.
 
@@ -5860,8 +5893,8 @@ Section 5.7 defines the `failed` outcome taxonomy (pre-provider vs. post-provide
 **B) Failure after reserve is taken but before provider invocation** (context assembly error, internal timeout, or transient infrastructure failure between successful preflight and the outbound provider call):
 
 - The reserve MUST be fully released (`charged_tokens = 0`).
-- A `modkit_outbox_events` row MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant (section 5.7). CyberChatManager receives a zero-charge event rather than no event.
-- The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction (consistent with section 5.8, "Pre-Provider Failure Handling").
+- A Mini-Chat outbox message MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant (section 5.7). CyberChatManager receives a zero-charge event rather than no event.
+- The reserve release, `chat_turns` state transition to `failed`, and outbox enqueue MUST occur in a single atomic DB transaction (consistent with section 5.8, "Pre-Provider Failure Handling").
 
 This distinction eliminates ambiguity: case (A) never holds a reserve and has no settlement obligation; case (B) holds a reserve that MUST be released with a mandatory outbox event (`settlement_method = "released"`). Both cases result in zero charges. The provider is never called in either case.
 
@@ -5903,7 +5936,7 @@ This maps to `chat_turns.state` transitioning from `running` to `failed`. The tr
 
 #### Outbox Emission Requirement
 
-When a post-stream terminal error is finalized, the system MUST emit a `modkit_outbox_events` row in the **same DB transaction** as the quota settlement and `chat_turns` state transition:
+When a post-stream terminal error is finalized, the system MUST emit a Mini-Chat outbox message in the **same DB transaction** as the quota settlement and `chat_turns` state transition:
 
 | Field | Value |
 |-------|-------|
@@ -5939,23 +5972,23 @@ Multiple terminal signals may arrive concurrently or in rapid succession for the
 
 **State transition enforcement**: the domain service MUST enforce the first-terminal-wins rule via a compare-and-set (CAS) guard on the `chat_turns.state` column. The finalization transaction MUST include a precondition that `state = 'running'` (or equivalently, use an `UPDATE ... WHERE state = 'running'` that affects exactly one row). If the CAS check yields zero affected rows, the signal arrived after another terminal transition already committed, and the service MUST treat this as a no-op: no quota settlement, no outbox insertion, no state change.
 
-**Outbox uniqueness backstop**: the partial unique index `(namespace, topic, dedupe_key)` on `modkit_outbox_events` serves as a secondary defense against duplicate billing events. However, the system MUST NOT rely on the unique constraint as the primary idempotency mechanism. The CAS guard at the state-transition level MUST prevent the duplicate outbox INSERT from being attempted in the first place. The unique constraint exists as a backstop for defensive integrity, not as a control-flow mechanism.
+**Outbox idempotency boundary**: the shared outbox pipeline does not provide a Mini-Chat-specific producer-side uniqueness backstop. Duplicate billing events MUST therefore be prevented before enqueue by the CAS guard at the state-transition level. The serialized usage payload still carries a stable `dedupe_key`, but that key exists for downstream idempotent consumption rather than as a storage-level control-flow mechanism inside Mini-Chat.
 
-**Combined guarantee**: for any turn that took a quota reserve, exactly one finalization transaction succeeds — performing the state transition, quota settlement, and outbox insertion atomically. All competing terminal signals either lose the CAS race (and become no-ops) or are blocked by the outbox dedupe constraint. It MUST be impossible for a single turn to produce more than one `modkit_outbox_events` row or to have its quota debited more than once.
+**Combined guarantee**: for any turn that took a quota reserve, exactly one finalization transaction succeeds — performing the state transition, quota settlement, and outbox enqueue atomically. All competing terminal signals lose the CAS race and become no-ops. Duplicate delivery after enqueue remains possible under at-least-once processing, but it MUST be impossible for a single turn to have its quota debited more than once or for more than one CAS-winning finalization path to emit distinct logical billing outcomes.
 
 **Race resolution rule**: both the terminal-error path and the disconnect/abort path attempt finalization using the same DB CAS guard (`WHERE state = 'running'`). Whichever commits first wins and emits the single outbox event. The loser observes `rows_affected = 0` and MUST NOT emit anything and MUST NOT debit quota. No advisory locks or in-memory coordination are required — the DB CAS guard is the sole arbitration mechanism.
 
 **Scenario 1 — Disconnect after terminal error**: the provider returns a terminal `event: error`, and the client subsequently disconnects (or the disconnect signal arrives after the error is processed):
 
-1. The error-handling path begins a finalization transaction: `UPDATE chat_turns SET state = 'failed' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the post-stream terminal error reconciliation rule (section 5.9), inserts a `modkit_outbox_events` row with `outcome = "failed"`, and commits atomically. The turn is now finalized as `FAILED`.
-2. The disconnect/cancellation path attempts its own finalization: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `failed`). The cancellation path MUST treat this as a no-op: no quota settlement, no outbox insertion, no further action on this turn.
+1. The error-handling path begins a finalization transaction: `UPDATE chat_turns SET state = 'failed' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the post-stream terminal error reconciliation rule (section 5.9), enqueues the corresponding Mini-Chat usage message with `outcome = "failed"`, and commits atomically. The turn is now finalized as `FAILED`.
+2. The disconnect/cancellation path attempts its own finalization: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `failed`). The cancellation path MUST treat this as a no-op: no quota settlement, no outbox enqueue, no further action on this turn.
 3. The orphan watchdog, if it later scans this turn, observes `state = 'failed'` (not `running`) and skips it.
 
 The disconnect after a terminal error is **irrelevant** — the terminal error already finalized the turn. The recorded outcome is `FAILED` with the settlement computed by the error path. No double settlement occurs.
 
 **Scenario 2 — Terminal error after disconnect** (disconnect arrives first, terminal error signal is delayed or arrives during abort processing):
 
-1. The disconnect/abort path begins a finalization transaction: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the ABORTED reconciliation formula (section 5.8), inserts a `modkit_outbox_events` row with `outcome = "aborted"`, and commits atomically. The turn is now finalized as `ABORTED`.
+1. The disconnect/abort path begins a finalization transaction: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the ABORTED reconciliation formula (section 5.8), enqueues the corresponding Mini-Chat usage message with `outcome = "aborted"`, and commits atomically. The turn is now finalized as `ABORTED`.
 2. The terminal error signal arrives. The error-handling path attempts: `UPDATE chat_turns SET state = 'failed' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `cancelled`). The error path MUST treat this as a no-op.
 3. If the disconnect path did NOT succeed (e.g., the pod crashed before committing), the turn remains in `running` state. The orphan watchdog will eventually finalize it as `failed` with `error_code = 'orphan_timeout'` — but only if the turn is still `IN_PROGRESS` (`running`). If another finalizer committed in the interim, the watchdog's CAS also returns 0 rows and it skips the turn.
 
@@ -6160,14 +6193,14 @@ The system **MUST** finalize turns using CAS on `chat_turn.state` and MUST emit 
 - [ ] If no tier is available, the system rejects at preflight with `quota_exceeded` and does not call the provider.
 - [ ] The system persists `policy_version_applied` per turn and uses the same version for settlement and outbox emission.
 - [ ] The system enforces a hard cap on `max_output_tokens` to prevent overshoot beyond reserved worst-case.
-- [ ] Replaying a completed turn for the same `(chat_id, request_id)` MUST NOT take a new quota reserve, debit credits, or emit a new outbox row (replay is side-effect-free).
+- [ ] Replaying a completed turn for the same `(chat_id, request_id)` MUST NOT take a new quota reserve, debit credits, or emit a new outbox message (replay is side-effect-free).
 - [ ] The orphan watchdog MUST finalize turns stuck in `running` state beyond the configured timeout using the same CAS guard, quota settlement, and outbox emission as all other finalization paths (P1 mandatory).
-- [ ] For any committed quota debit, there MUST exist exactly one corresponding `modkit_outbox_events` row (written in the same DB transaction as the settlement).
+- [ ] For any committed quota debit, there MUST exist exactly one corresponding Mini-Chat outbox message enqueue in the same DB transaction as the settlement.
 - [ ] Quota enforcement uses `quota_usage` bucket rows: `total` for overall cap, `tier:premium` for premium subcap. Standard-tier availability checks only bucket `total`; premium-tier checks both.
 
 ### 5.13 Deferred to P2+
 
-**Clarification**: the transactional outbox mechanism (`modkit_outbox_events`), the CAS-guarded finalization contract, and the orphan watchdog are all P1 mandatory (sections 5.6–5.9). The following billing integration details are deferred to P2+:
+**Clarification**: the transactional outbox mechanism, the CAS-guarded finalization contract, and the orphan watchdog are all P1 mandatory (sections 5.6–5.9). The following billing integration details are deferred to P2+:
 
 - Detailed usage event payload schemas and formal envelope definitions (P1 uses the payload structure defined inline in sections 5.7–5.9)
 - `MiniChat.TurnCompleted` / `MiniChat.TurnCancelled` event envelope definitions
@@ -6638,7 +6671,7 @@ Note: per-model `max_file_size_mb` is available from **CCM API**: `GET /policies
 
 | Parameter | Type | Default | Valid range | Source |
 |-----------|------|---------|-------------|--------|
-| `orphan_watchdog.timeout_seconds` | `integer` | `300` | `60..=3600` | **ConfigMap** |
+| `orphan_watchdog.timeout_secs` | `integer` | `300` | `60..=3600` | **ConfigMap** |
 | `orphan_watchdog.enabled` | `bool` | — | — | **ConfigMap** |
 | `orphan_watchdog.scan_interval_secs` | `integer` | `60` | — | **ConfigMap** |
 
@@ -6646,12 +6679,12 @@ Note: per-model `max_file_size_mb` is available from **CCM API**: `GET /policies
 
 **Definition**:
 
-An orphan turn is a `chat_turns` row that remains in `state = 'running'` after the configured orphan timeout has elapsed and has not reached any terminal state.
+An orphan turn is a `chat_turns` row that remains in `state = 'running'` after the configured orphan timeout has elapsed since durable `last_progress_at` and has not reached any terminal state.
 
 For P1, the watchdog MUST treat a turn as orphaned when all of the following are true:
 
 1. `state = 'running'`
-2. `started_at <= now() - orphan_watchdog.timeout_seconds`
+2. `last_progress_at <= now() - orphan_watchdog.timeout_secs`
 3. no terminal transition (`completed`, `failed`, `cancelled`) and deleted_at IS NULL has been persisted for that turn
 
 **Execution model**:
@@ -6685,11 +6718,13 @@ UPDATE chat_turns
 SET
     state = 'failed',
     error_code = 'orphan_timeout',
+    completed_at = now(),
     updated_at = now()
 WHERE
     id = $1
     AND state = 'running'
-    AND started_at <= now() - interval '1 second' * $timeout_seconds
+    AND deleted_at IS NULL
+    AND last_progress_at <= now() - interval '1 second' * $timeout_secs
 RETURNING id;
 ```
 
@@ -6733,7 +6768,7 @@ This settlement uses the preflight snapshot persisted in `chat_turns`:
 
 Because these values were persisted at preflight, the system can deterministically compute estimated settlement even when no provider usage information is available.
 
-The watchdog therefore emits the required `modkit_outbox_events` usage record **not because the watchdog generated tokens**, but because it must finalize the lifecycle of the abandoned turn and ensure that exactly one billing event is produced for that turn.
+The watchdog therefore emits the required usage outbox message **not because the watchdog generated tokens**, but because it must finalize the lifecycle of the abandoned turn and ensure that exactly one billing event is produced for that turn.
 
 This preserves the Mini Chat invariant:
 
@@ -6741,12 +6776,20 @@ This preserves the Mini Chat invariant:
 
 **Required effects on orphan detection**:
 
-When an orphan turn is detected, the watchdog MUST:
+When an orphan turn is detected, the watchdog MUST attempt a single conditional finalization update guarded by:
 
-1. transition the turn to `state = 'failed'`
+- `state = 'running'`
+- `deleted_at IS NULL`
+- `last_progress_at <= now() - interval '1 second' * orphan_watchdog.timeout_secs`
+
+Only if that conditional update succeeds may the watchdog:
+
+1. transition the turn to `state = 'failed'` and write terminal timestamps (`completed_at`, `updated_at`)
 2. record a machine-readable failure reason equivalent to `orphan_timeout`
 3. finalize bounded quota settlement according to the existing turn billing rules
-4. emit the required `modkit_outbox_events` row for billing/usage attribution
+4. emit the required outbox message for billing/usage attribution
+
+If the conditional update affects 0 rows, the watchdog MUST treat the row as no longer orphan-finalizable and MUST NOT perform settlement, outbox emission, or orphan-finalized metrics for that row.
 
 The watchdog MUST NOT create or modify `messages` rows.
 
@@ -6762,8 +6805,8 @@ Orphan cleanup is asynchronous and MUST NOT block any user-visible request path.
 
 **Observability (P1)**:
 
-- `mini_chat_orphan_detected_total` (counter) — turns identified as orphaned
-- `mini_chat_orphan_failed_total` (counter) — orphan turns successfully transitioned to terminal failure
+- `mini_chat_orphan_detected_total{reason}` (counter) — increments when the watchdog identifies an orphan candidate by the stale-progress rule; `reason`: `stale_progress`
+- `mini_chat_orphan_finalized_total{reason}` (counter) — increments only when the watchdog successfully wins the CAS finalization and transitions the turn to terminal orphan outcome; `reason`: `stale_progress`
 - `mini_chat_orphan_scan_duration_seconds` (histogram) — watchdog scan duration
 
 ### B.9.2 Cleanup worker
@@ -6772,6 +6815,8 @@ Orphan cleanup is asynchronous and MUST NOT block any user-visible request path.
 |-----------|------|---------|--------|
 | `cleanup_worker.enabled` | `bool` | `true` | **ConfigMap** |
 | `cleanup_worker.poll_interval_secs` | `integer` | `60` | **ConfigMap** |
+| `cleanup_worker.reconcile_interval_secs` | `integer` | `300` | **ConfigMap** |
+| `cleanup_worker.stale_in_progress_timeout_secs` | `integer` | `900` | **ConfigMap** |
 | `cleanup_worker.batch_size` | `integer` | `32` | **ConfigMap** |
 | `cleanup_worker.max_attempts` | `integer` | `5` | **ConfigMap** |
 
@@ -6784,18 +6829,24 @@ These resources include:
 
 Cleanup is performed asynchronously and is idempotent.
 
-The worker scans for attachments belonging to soft-deleted chats whose cleanup state is not terminal and performs provider deletion through OAGW.
+Attachment cleanup is driven by persisted `attachments.cleanup_status` rows. Vector-store cleanup is driven by periodic reconciliation over persisted `chat_vector_stores` rows whose parent chat is soft-deleted. A vector store becomes delete-eligible only when all attachment cleanup rows for that chat are `done`; any `failed` attachment row blocks provider purge. If vector-store deletion fails retryably, the `chat_vector_stores` row remains in place and the worker retries in a later reconciliation cycle. Because P1 does not define a separate vector-store row-state machine, canonical backlog state metrics apply to attachment rows only. `cleanup_worker.max_attempts` applies to attachment cleanup rows only.
 
-### B.9.3 Outbox dispatcher
+### B.9.3 Shared `modkit-db::outbox` integration
 
-| Parameter | Type | Default | Valid range | Source |
-|-----------|------|---------|-------------|--------|
-| `outbox_dispatcher.max_attempts` | `integer` | `10` | `3..=100` | **ConfigMap** |
-| `outbox_dispatcher.base_delay_seconds` | `integer` | `2` | `1..=60` | **ConfigMap** |
-| `outbox_dispatcher.max_delay_seconds` | `integer` | `300` | `base..=3600` | **ConfigMap** |
-| `outbox_dispatcher.batch_size` | — | — | — | **ConfigMap** |
-| `outbox_dispatcher.lease_duration` | — | — | — | **ConfigMap** |
-| `outbox_dispatcher.poll_interval` | — | — | — | **ConfigMap** |
+Mini-Chat does not define a separate Mini-Chat-specific dispatcher row-state configuration surface. P1 uses the shared `modkit-db::outbox` queue-registration and builder configuration.
+
+| Parameter | Owner | Default | Notes |
+|-----------|-------|---------|-------|
+| `sequencer_batch_size` | `OutboxBuilder` | `100` | Shared sequencer batch size |
+| `poll_interval` | `OutboxBuilder` | `1s` | Shared fallback poll interval for sequencer and processors |
+| `vacuum_cooldown` | `OutboxBuilder` | `1h` | Shared vacuum sweep cooldown |
+| `lease_duration` | `QueueBuilder` | `30s` | Applies to decoupled handlers only |
+| `backoff_base` | `QueueBuilder` | `1s` | Base delay for `HandlerResult::Retry` |
+| `backoff_max` | `QueueBuilder` | `60s` | Max delay for `HandlerResult::Retry` |
+| `max_concurrent_partitions` | `QueueBuilder` | all partitions | Must fit DB pool size |
+| `msg_batch_size` | `QueueBuilder` | `1` | Single-message decoupled handlers force `1` |
+
+Concrete deployment keys for these parameters are integration-specific, but their semantics MUST match the shared `modkit-db::outbox` API rather than a Mini-Chat-specific dispatcher row model.
 
 ### B.9.4 Thread summary worker
 
