@@ -268,3 +268,8 @@ git_release_enable = false
 name = "cf-static-mini-chat-audit-plugin"
 changelog_update = false
 git_release_enable = false
+
+[[package]]
+name = "cf-static-mini-chat-model-policy-plugin"
+changelog_update = false
+git_release_enable = false
