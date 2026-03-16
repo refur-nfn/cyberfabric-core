@@ -19,7 +19,6 @@ workspace = true
 
 [features]
 with-utoipa = ["dep:utoipa"]
-chrono = []
 
 [dependencies]
 modkit-errors = { workspace = true }

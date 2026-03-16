@@ -576,7 +576,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_datetime_conversion() {
         use chrono::Utc;
@@ -592,7 +591,6 @@ mod tests {
         assert!(query.has_filter());
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_naive_date_conversion() {
         use chrono::NaiveDate;
@@ -607,7 +605,6 @@ mod tests {
         assert!(query.has_filter());
     }
 
-    #[cfg(feature = "chrono")]
     #[test]
     fn test_chrono_naive_time_conversion() {
         use chrono::NaiveTime;

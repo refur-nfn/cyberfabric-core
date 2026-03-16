@@ -14,9 +14,9 @@ mod tests {
             Expr::And(a, b) => {
                 match *a {
                     Expr::Compare(l, op, r) => {
-                        matches!(*l, Expr::Identifier(_));
+                        assert!(matches!(*l, Expr::Identifier(_)));
                         assert!(matches!(op, CompareOperator::Ge));
-                        matches!(*r, Expr::Value(Value::Number(_)));
+                        assert!(matches!(*r, Expr::Value(Value::Number(_))));
                     }
                     _ => panic!("left not compare"),
                 }
