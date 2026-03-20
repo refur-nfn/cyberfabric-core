@@ -58,6 +58,9 @@ pub const MODKIT_DIRECTORY_ENDPOINT_ENV: &str = "MODKIT_DIRECTORY_ENDPOINT";
 /// Environment variable name for passing rendered module config to `OoP` modules.
 pub const MODKIT_MODULE_CONFIG_ENV: &str = "MODKIT_MODULE_CONFIG";
 
+/// Default shutdown deadline for graceful module stop (30 seconds).
+pub const DEFAULT_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `HostRuntime` owns the lifecycle orchestration for `ModKit`.
 ///
 /// It encapsulates all runtime state and drives modules through the full lifecycle (see module docs).
@@ -74,6 +77,8 @@ pub struct HostRuntime {
     db_options: DbOptions,
     /// `OoP` module spawn configuration and backend
     oop_options: Option<OopSpawnOptions>,
+    /// Maximum time allowed for graceful shutdown before hard-stop signal is sent.
+    shutdown_deadline: std::time::Duration,
 }
 
 impl HostRuntime {
@@ -118,7 +123,18 @@ impl HostRuntime {
             cancel,
             db_options,
             oop_options,
+            shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
         }
+    }
+
+    /// Set a custom shutdown deadline for graceful module stop.
+    ///
+    /// This is the maximum time the runtime will wait for modules to stop gracefully
+    /// before sending the hard-stop signal (cancelling the deadline token).
+    #[must_use]
+    pub fn with_shutdown_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.shutdown_deadline = deadline;
+        self
     }
 
     /// `PRE_INIT` phase: wire runtime internals into system modules.
@@ -560,15 +576,54 @@ impl HostRuntime {
 
     /// STOP phase: stop all stateful modules in reverse order.
     ///
+    /// # Two-Phase Shutdown Contract
+    ///
+    /// This phase implements a proper two-phase shutdown:
+    ///
+    /// 1. **Graceful stop request**: Each module's `stop(deadline_token)` is called with a
+    ///    *fresh* cancellation token (not the already-cancelled root token). Modules should
+    ///    interpret this as "please stop gracefully".
+    ///
+    /// 2. **Hard-stop deadline**: After `shutdown_deadline` expires, the `deadline_token` is
+    ///    cancelled. Modules should interpret this as "abort immediately".
+    ///
+    /// This allows modules to implement real graceful shutdown:
+    /// - Request cooperative shutdown of child tasks
+    /// - Wait for them to finish gracefully
+    /// - If `deadline_token` fires, switch to hard-abort mode
+    ///
     /// Errors are logged but do not fail the shutdown process.
     /// Note: `OoP` modules are stopped automatically by the backend when the
     /// cancellation token is triggered.
     async fn run_stop_phase(&self) -> Result<(), RegistryError> {
         tracing::info!("Phase: stop");
 
+        // Create a fresh deadline token for the stop phase.
+        // This token is NOT already cancelled (unlike self.cancel which triggered the stop phase).
+        // Modules can use this to implement two-phase shutdown:
+        // - Start graceful shutdown immediately
+        // - Switch to hard-abort when deadline_token is cancelled
+        let deadline_token = CancellationToken::new();
+        let deadline = self.shutdown_deadline;
+
+        // Spawn a task to cancel the deadline token after the shutdown deadline
+        let deadline_token_for_timeout = deadline_token.clone();
+        let deadline_task = tokio::spawn(async move {
+            tokio::time::sleep(deadline).await;
+            tracing::warn!(
+                deadline_secs = deadline.as_secs(),
+                "Shutdown deadline reached, sending hard-stop signal"
+            );
+            deadline_token_for_timeout.cancel();
+        });
+
+        // Stop all modules in reverse order with the fresh deadline token
         for e in self.registry.modules().iter().rev() {
-            Self::stop_one_module(e, self.cancel.clone()).await;
+            Self::stop_one_module(e, deadline_token.clone()).await;
         }
+
+        // Cancel the deadline task if all modules stopped before the deadline
+        deadline_task.abort();
 
         Ok(())
     }
@@ -1073,6 +1128,225 @@ mod tests {
                 "init:user_c",
                 "post_init:sys_a",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_phase_provides_fresh_deadline_token() {
+        use std::sync::atomic::AtomicBool;
+
+        struct TokenCheckModule {
+            token_was_cancelled_on_entry: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Module for TokenCheckModule {
+            async fn init(&self, _ctx: &ModuleCtx) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RunnableCapability for TokenCheckModule {
+            async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
+                // Record whether the token was already cancelled when stop() was called
+                self.token_was_cancelled_on_entry
+                    .store(deadline_token.is_cancelled(), Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let token_was_cancelled = Arc::new(AtomicBool::new(true)); // Default to true to detect if not set
+        let module = Arc::new(TokenCheckModule {
+            token_was_cancelled_on_entry: token_was_cancelled.clone(),
+        });
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("test", &[], module.clone() as Arc<dyn Module>);
+        builder.register_stateful_with_meta("test", module.clone() as Arc<dyn RunnableCapability>);
+
+        let registry = builder.build_topo_sorted().unwrap();
+        let client_hub = Arc::new(ClientHub::new());
+        let cancel = CancellationToken::new();
+        let config_provider: Arc<dyn ConfigProvider> = Arc::new(EmptyConfigProvider);
+
+        let runtime = HostRuntime::new(
+            registry,
+            config_provider,
+            DbOptions::None,
+            client_hub,
+            cancel.clone(),
+            Uuid::new_v4(),
+            None,
+        );
+
+        // Run stop phase - the deadline token should NOT be cancelled
+        runtime.run_stop_phase().await.unwrap();
+
+        // The token should NOT have been cancelled when stop() was called
+        // This is the key fix: modules get a fresh token, not the already-cancelled root token
+        assert!(
+            !token_was_cancelled.load(Ordering::SeqCst),
+            "deadline_token should NOT be cancelled when stop() is called - this enables graceful shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_phase_graceful_shutdown_completes_before_deadline() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct GracefulModule {
+            graceful_completed: Arc<AtomicBool>,
+            deadline_fired: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Module for GracefulModule {
+            async fn init(&self, _ctx: &ModuleCtx) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RunnableCapability for GracefulModule {
+            async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
+                // Simulate graceful shutdown that completes quickly (10ms)
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        self.graceful_completed.store(true, Ordering::SeqCst);
+                    }
+                    () = deadline_token.cancelled() => {
+                        self.deadline_fired.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let graceful_completed = Arc::new(AtomicBool::new(false));
+        let deadline_fired = Arc::new(AtomicBool::new(false));
+        let module = Arc::new(GracefulModule {
+            graceful_completed: graceful_completed.clone(),
+            deadline_fired: deadline_fired.clone(),
+        });
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("test", &[], module.clone() as Arc<dyn Module>);
+        builder.register_stateful_with_meta("test", module.clone() as Arc<dyn RunnableCapability>);
+
+        let registry = builder.build_topo_sorted().unwrap();
+        let client_hub = Arc::new(ClientHub::new());
+        let cancel = CancellationToken::new();
+        let config_provider: Arc<dyn ConfigProvider> = Arc::new(EmptyConfigProvider);
+
+        // Use a long deadline (5s) - module should complete gracefully before this
+        let runtime = HostRuntime::new(
+            registry,
+            config_provider,
+            DbOptions::None,
+            client_hub,
+            cancel.clone(),
+            Uuid::new_v4(),
+            None,
+        )
+        .with_shutdown_deadline(Duration::from_secs(5));
+
+        runtime.run_stop_phase().await.unwrap();
+
+        // Graceful shutdown should have completed
+        assert!(
+            graceful_completed.load(Ordering::SeqCst),
+            "graceful shutdown should complete"
+        );
+        // Deadline should NOT have fired (module finished before deadline)
+        assert!(
+            !deadline_fired.load(Ordering::SeqCst),
+            "deadline should not fire when graceful shutdown completes quickly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_phase_deadline_fires_for_slow_module() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct SlowModule {
+            graceful_completed: Arc<AtomicBool>,
+            deadline_fired: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl Module for SlowModule {
+            async fn init(&self, _ctx: &ModuleCtx) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RunnableCapability for SlowModule {
+            async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()> {
+                // Simulate slow graceful shutdown (would take 10s, but deadline is 100ms)
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(10)) => {
+                        self.graceful_completed.store(true, Ordering::SeqCst);
+                    }
+                    () = deadline_token.cancelled() => {
+                        self.deadline_fired.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let graceful_completed = Arc::new(AtomicBool::new(false));
+        let deadline_fired = Arc::new(AtomicBool::new(false));
+        let module = Arc::new(SlowModule {
+            graceful_completed: graceful_completed.clone(),
+            deadline_fired: deadline_fired.clone(),
+        });
+
+        let mut builder = RegistryBuilder::default();
+        builder.register_core_with_meta("test", &[], module.clone() as Arc<dyn Module>);
+        builder.register_stateful_with_meta("test", module.clone() as Arc<dyn RunnableCapability>);
+
+        let registry = builder.build_topo_sorted().unwrap();
+        let client_hub = Arc::new(ClientHub::new());
+        let cancel = CancellationToken::new();
+        let config_provider: Arc<dyn ConfigProvider> = Arc::new(EmptyConfigProvider);
+
+        // Use a short deadline (100ms) - module should be interrupted by deadline
+        let runtime = HostRuntime::new(
+            registry,
+            config_provider,
+            DbOptions::None,
+            client_hub,
+            cancel.clone(),
+            Uuid::new_v4(),
+            None,
+        )
+        .with_shutdown_deadline(Duration::from_millis(100));
+
+        runtime.run_stop_phase().await.unwrap();
+
+        // Graceful shutdown should NOT have completed (deadline fired first)
+        assert!(
+            !graceful_completed.load(Ordering::SeqCst),
+            "graceful shutdown should not complete when deadline fires first"
+        );
+        // Deadline should have fired
+        assert!(
+            deadline_fired.load(Ordering::SeqCst),
+            "deadline should fire for slow modules"
         );
     }
 }
