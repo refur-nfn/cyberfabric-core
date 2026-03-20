@@ -63,7 +63,7 @@ The module **MUST** return the provider's API endpoint and GTS type for credenti
 The module **MUST** return provider health status (healthy, degraded, unhealthy) and optionally latency and error rate metrics for proactive provider selection.
 
 - **Rationale**: LLM Gateway uses health metrics to select providers before making requests, avoiding providers that are degraded or unhealthy.
-- **Source**: `modules/llm-gateway` ([`cpt-cf-llm-gateway-adr-circuit-breaking`](../../llm-gateway/docs/ADR/0004-fdd-llmgw-adr-circuit-breaking.md))
+- **Source**: `modules/llm-gateway` ([`cpt-cf-llm-gateway-adr-circuit-breaking`](../../llm-gateway/docs/ADR/0004-fdd-llmgw-adr-circuit-breaking.md), [`cpt-cf-llm-gateway-fr-provider-fallback-v1`](../../llm-gateway/docs/PRD.md))
 
 #### Tenant Hierarchy Resolution
 
@@ -81,7 +81,7 @@ The module **MUST** resolve approval status considering the tenant hierarchy, wh
 The module **MUST** resolve model lookups within <10ms at P99 latency.
 
 - **Rationale**: LLM Gateway calls model resolution on every request; high latency here directly impacts end-user response times.
-- **Source**: `modules/llm-gateway` ([`cpt-cf-model-registry-nfr-performance`](./PRD.md))
+- **Source**: `modules/llm-gateway` ([`cpt-cf-llm-gateway-seq-provider-resolution-v1`](../../llm-gateway/docs/DESIGN.md))
 
 #### Specific Error Responses
 

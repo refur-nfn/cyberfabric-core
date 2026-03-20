@@ -140,6 +140,16 @@ The system **MUST** allow users to delete a task permanently.
 **Rationale**: Users need to remove irrelevant or mistaken tasks.
 **Actors**: `cpt-examples-todo-app-actor-user`
 
+#### Real-Time Sync via Changes Feed
+
+- [x] `p1` - **ID**: `cpt-examples-todo-app-fr-changes-feed`
+
+The system **MUST** propagate task changes to all connected devices in real time via a changes feed.
+
+**Rationale**: Cross-device synchronization is a core product capability; users expect changes to appear immediately on all devices.
+**Actors**: `cpt-examples-todo-app-actor-user`
+**Covers**: `cpt-examples-todo-app-upreq-changes-feed`
+
 ### 5.2 Organization
 
 #### Filter Tasks
@@ -221,7 +231,6 @@ The system **MUST** support offline mode where task creation, completion, filter
 **Direction**: required from client (external sync backend)
 **Protocol/Format**: WebSocket + JSON for real-time task updates
 **Compatibility**: Protocol versioned independently; supports graceful degradation to polling
-**Covers**: `cpt-examples-todo-app-upreq-changes-feed`
 
 ## 8. Use Cases
 
