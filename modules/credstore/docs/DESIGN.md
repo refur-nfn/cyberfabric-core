@@ -92,9 +92,9 @@ CredStore follows the ModKit Gateway + Plugins pattern (same architecture as `te
 
 The SDK crate (`credstore-sdk`) defines two trait boundaries: `CredStoreClientV1` for consumers and `CredStorePluginClientV1` for backend implementations. Consumers depend only on the gateway trait and never interact with plugins directly. This decoupling allows runtime backend selection without changing consumer code.
 
-The architecture provides simple CRUD operations (get, put, delete) for tenant-scoped secrets. The tenant ID is always derived from SecurityCtx for self-service operations. Authorization is enforced exclusively in the gateway layer. **Hierarchical secret resolution** (the walk-up algorithm that searches for secrets across tenant ancestors) is implemented in the Gateway using `tenant_resolver` to query the tenant hierarchy. Plugins are storage adapters providing per-tenant key-value operations with no policy or hierarchical logic.
+The architecture provides simple CRUD operations (get, put, delete) for tenant-scoped secrets. The tenant ID is always derived from SecurityCtx for self-service operations. Authorization is enforced exclusively in the gateway layer. For simple backend plugins (VendorA Credstore, OS keychain), **hierarchical secret resolution** (the walk-up algorithm that searches for secrets across tenant ancestors) is implemented in the Gateway using `tenant_resolver` to query the tenant hierarchy. These plugins are storage adapters providing per-tenant key-value operations with no policy or hierarchical logic.
 
-A dedicated `credentials_storage` plugin provides an alternative backend — a standalone Rust microservice with encrypted credential storage, schema validation, field-level masking, and pluggable tenant key management via a `KeyProvider` abstraction. The `KeyProvider` supports two modes: local database storage (for development/simple deployments) and external key management service integration (HashiCorp Vault, AWS KMS) for production environments requiring key–data separation. The detailed plugin architecture will be documented in `plugins/credentials-storage/DESIGN.md`.
+The `credentials_storage` plugin is an exception to this pattern. It is a standalone Rust microservice that implements credential merge/propagation resolution internally (own → inherited → default), along with encrypted credential storage, schema validation, field-level masking, and pluggable tenant key management via a `KeyProvider` abstraction. When this plugin is active, the Gateway delegates merge resolution to the plugin rather than performing the walk-up algorithm itself. The `KeyProvider` supports two modes: local database storage (for development/simple deployments) and external key management service integration (HashiCorp Vault, AWS KMS) for production environments requiring key–data separation. The detailed plugin architecture will be documented in `plugins/credentials-storage/DESIGN.md`.
 
 ### 1.2 Architecture Drivers
 
@@ -145,7 +145,7 @@ A dedicated `credentials_storage` plugin provides an alternative backend — a s
 |-------|---------------|------------|
 | SDK | Public and plugin trait definitions, models, errors | Rust crate (`credstore-sdk`) |
 | Gateway | Authorization enforcement, hierarchical resolution, sharing mode enforcement, plugin resolution, REST API | Rust crate (`credstore`), Axum, tenant_resolver |
-| Plugins | Backend-specific secret storage operations (simple per-tenant CRUD) | Rust crates, HTTP client / OS APIs |
+| Plugins | Backend-specific secret storage operations. Simple plugins (VendorA, OS keychain) provide per-tenant CRUD only. The `credentials_storage` plugin handles merge resolution, encryption, and schema validation internally. | Rust crates, HTTP client / OS APIs |
 | External | Secret persistence and encryption (no hierarchical logic) | VendorA Credstore (Go), OS keychain, External Key Service (Vault/KMS) |
 
 ## 2. Goals / Non-Goals
@@ -173,7 +173,7 @@ The following capabilities are explicitly out of scope for v1:
 - **Secret rotation automation**: Automatic secret rotation, expiration, or lifecycle management is out of scope.
 - **Direct end-user access**: Unauthenticated or untrusted client access (e.g., browser-based secret retrieval without platform authentication) is out of scope.
 - **Secret templates or composition**: Dynamic secret generation, composition from templates, or secret derivation is out of scope.
-- **Hierarchical resolution in Backend**: Backends provide simple per-tenant key-value storage only. All hierarchical walk-up logic, sharing mode enforcement, and policy decisions are in Gateway.
+- **Hierarchical resolution in simple backends**: Simple backends (VendorA Credstore, OS keychain) provide per-tenant key-value storage only — all hierarchical walk-up logic, sharing mode enforcement, and policy decisions are in Gateway. The `credentials_storage` plugin is an exception: it implements credential merge resolution internally.
 - **Secret discovery / search**: Listing all secrets, searching by tags, or full-text search across secret values is out of scope for v1.
 
 ## 3. Principles & Constraints
@@ -184,9 +184,9 @@ The following capabilities are explicitly out of scope for v1:
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-authz-gateway`
 
-Authorization (permission checks for `Secrets:Read` and `Secrets:Write`) is enforced exclusively in the gateway layer. Plugins are "storage adapters" that delegate to backends and MUST NOT implement authorization or policy decisions. This prevents inconsistent behavior across backends.
+Authorization (permission checks for `Secrets:Read` and `Secrets:Write`) is enforced exclusively in the gateway layer. Simple plugins (VendorA, OS keychain) are "storage adapters" that delegate to backends and MUST NOT implement authorization or policy decisions. This prevents inconsistent behavior across backends.
 
-**Note**: The Gateway also implements sharing mode enforcement (determining which secrets are accessible based on `private`/`tenant`/`shared` modes during hierarchical resolution). This is part of the Gateway's policy layer, distinct from the Backend's simple per-tenant storage semantics.
+**Note**: For simple plugins, the Gateway also implements sharing mode enforcement and hierarchical resolution. The `credentials_storage` plugin is a full microservice that handles its own merge resolution, authorization (JWT + Permission Service), and sharing logic internally — in this case the Gateway delegates these responsibilities to the plugin.
 
 #### Stateless Key Mapping
 
@@ -296,7 +296,7 @@ graph TB
 **Interactions**:
 - Consumer → Gateway: via `CredStoreClientV1` trait through ClientHub
 - Gateway → Plugin: via `CredStorePluginClientV1` trait through scoped ClientHub (GTS instance ID)
-- Gateway → tenant_resolver: queries tenant ancestry chain for hierarchical secret resolution walk-up
+- Gateway → tenant_resolver: queries tenant ancestry chain for hierarchical secret resolution walk-up (simple plugins only; `credentials_storage` handles resolution internally)
 - VendorA Plugin → Credstore: HTTP REST with OAuth2 bearer token (simple per-tenant CRUD operations)
 - VendorA Plugin → OAuth provider: token acquisition and caching
 - Credentials Storage Plugin → PostgreSQL: encrypted credential persistence (database-agnostic in future)
@@ -654,19 +654,19 @@ graph LR
 
 ### 5.1 Architectural Trade-offs
 
-#### Hierarchical Resolution in Gateway (not Backend)
+#### Hierarchical Resolution in Gateway (for simple plugins)
 
-**Decision**: Implement hierarchical walk-up algorithm in Gateway module, not in VendorA Credstore backend.
+**Decision**: Implement hierarchical walk-up algorithm in Gateway module for simple plugins (VendorA Credstore, OS keychain). The `credentials_storage` plugin handles merge resolution internally.
 
 **Trade-offs**:
-- ✅ **Pro**: Centralized policy enforcement — all sharing mode logic and access control is in one place
-- ✅ **Pro**: Backend remains simple — just per-tenant key-value storage, easier to maintain and test
+- ✅ **Pro**: Centralized policy enforcement for simple plugins — all sharing mode logic and access control is in one place
+- ✅ **Pro**: Simple backends remain simple — just per-tenant key-value storage, easier to maintain and test
 - ✅ **Pro**: Plugin portability — OS keychain plugin doesn't need to understand hierarchy
 - ✅ **Pro**: Easier to change hierarchy logic without backend changes
-- ❌ **Con**: Multiple backend calls during walk-up (N calls for N-deep hierarchy)
-- ❌ **Con**: Gateway must query tenant_resolver for hierarchy information
+- ❌ **Con**: Multiple backend calls during walk-up (N calls for N-deep hierarchy) — not applicable to `credentials_storage` which resolves internally
+- ❌ **Con**: Gateway must query tenant_resolver for hierarchy information (simple plugins only)
 
-**Mitigation**: Cache tenant hierarchy queries in Gateway; implement early termination on first accessible secret.
+**Mitigation**: Cache tenant hierarchy queries in Gateway; implement early termination on first accessible secret. The `credentials_storage` plugin avoids this overhead by resolving the merge chain in a single service call.
 
 #### Three-Tier Sharing Model (not RBAC/ABAC)
 
@@ -929,7 +929,7 @@ Following the ModKit plugin pattern (as documented in `docs/MODKIT_PLUGINS.md` a
 2. Each plugin registers its GTS instance and scoped `CredStorePluginClientV1` in ClientHub
 3. Gateway resolves the active plugin via GTS instance query and vendor configuration
 
-**Exactly one storage plugin is active per deployment** (selected by configuration `vendor` field match). The Gateway handles all cross-cutting concerns (authorization, hierarchical resolution, sharing mode enforcement), while plugins provide simple per-tenant CRUD operations without policy or hierarchical logic.
+**Exactly one storage plugin is active per deployment** (selected by configuration `vendor` field match). For simple plugins (VendorA, OS keychain), the Gateway handles all cross-cutting concerns (authorization, hierarchical resolution, sharing mode enforcement), while the plugins provide simple per-tenant CRUD operations. The `credentials_storage` plugin is a full microservice that handles merge resolution, authorization, and encryption internally — when active, the Gateway delegates these responsibilities to the plugin.
 
 **GTS Types:**
 - Schema: `gts.x.core.modkit.plugin.v1~x.core.credstore.plugin.v1~`

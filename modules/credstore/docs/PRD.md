@@ -263,7 +263,7 @@ The system **MUST** support hierarchical secret resolution: given a secret refer
 
 **Hierarchical Direction**: Resolution is **upward-only** (child → parent → root). A tenant can access ancestor secrets marked as `shared`, but parent tenants **cannot** access child tenant secrets (even if marked as `shared`). This enforces least privilege and enables shadowing.
 
-**Implementation Note**: This walk-up algorithm and sharing mode enforcement are implemented in the Gateway module (credstore). The Gateway queries the tenant hierarchy via `tenant_resolver`, then at each level performs a two-phase lookup: first the Plugin's `get` with the caller's `owner_id` (private secret), then `get` without `owner_id` (tenant/shared secret). The Plugin and Backend provide simple per-tenant key-value storage without hierarchical logic.
+**Implementation Note**: For simple plugins (VendorA Credstore, OS keychain), this walk-up algorithm and sharing mode enforcement are implemented in the Gateway module (credstore). The Gateway queries the tenant hierarchy via `tenant_resolver`, then at each level performs a two-phase lookup: first the Plugin's `get` with the caller's `owner_id` (private secret), then `get` without `owner_id` (tenant/shared secret). These plugins provide simple per-tenant key-value storage without hierarchical logic. The `credentials_storage` plugin implements credential merge resolution internally — when active, the Gateway delegates resolution to the plugin.
 
 **Rationale**: Enables the core business use case — OAGW retrieves a partner's shared API key when making calls on behalf of a customer.
 **Actors**: `cpt-cf-credstore-actor-oagw`
@@ -636,8 +636,8 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 
 ## 11. Assumptions
 
-- Hierarchical secret resolution (walk-up algorithm and sharing mode enforcement) is implemented in the Gateway module (credstore), not in the Backend
-- Plugins and Backends provide simple per-tenant key-value storage without hierarchical logic
+- For simple plugins (VendorA, OS keychain), hierarchical secret resolution (walk-up algorithm and sharing mode enforcement) is implemented in the Gateway module (credstore). The `credentials_storage` plugin handles merge resolution internally.
+- Simple plugins and their backends provide per-tenant key-value storage without hierarchical logic. The `credentials_storage` plugin is a full microservice with its own resolution, encryption, and authorization.
 - OAGW is a ModKit module that uses the standard CredStore SDK client (all access flows through Gateway→Plugin→Backend)
 - Gateway provides tenant-scoped CRUD operations, hierarchical resolution, and routes requests to the active storage plugin
 - Tenant hierarchy is managed externally and accessible via `tenant_resolver` (used by Gateway for hierarchical walk-up)
