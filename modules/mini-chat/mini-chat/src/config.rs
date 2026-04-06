@@ -335,11 +335,6 @@ pub struct StreamingConfig {
     /// Default 32768 (matching common model limits).
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
-
-    /// Search context size passed to the `web_search` tool.
-    /// Valid values: "low", "medium", "high" (default "low").
-    #[serde(default)]
-    pub web_search_context_size: crate::domain::llm::WebSearchContextSize,
 }
 
 impl Default for StreamingConfig {
@@ -348,7 +343,6 @@ impl Default for StreamingConfig {
             sse_channel_capacity: default_channel_capacity(),
             sse_ping_interval_seconds: default_ping_interval(),
             max_output_tokens: default_max_output_tokens(),
-            web_search_context_size: crate::domain::llm::WebSearchContextSize::default(),
         }
     }
 }
@@ -373,7 +367,6 @@ impl StreamingConfig {
                 self.sse_ping_interval_seconds
             ));
         }
-        // web_search_context_size validated by serde at parse time (enum).
         Ok(())
     }
 }
@@ -1092,35 +1085,6 @@ mod tests {
             .validate()
             .is_err()
         );
-    }
-
-    #[test]
-    fn streaming_config_web_search_context_size_enum() {
-        use crate::domain::llm::WebSearchContextSize;
-
-        // Default is Low
-        let cfg = StreamingConfig::default();
-        assert_eq!(cfg.web_search_context_size, WebSearchContextSize::Low);
-
-        // Valid values deserialize correctly
-        for (json_val, expected) in [
-            ("\"low\"", WebSearchContextSize::Low),
-            ("\"medium\"", WebSearchContextSize::Medium),
-            ("\"high\"", WebSearchContextSize::High),
-        ] {
-            let json = format!(r#"{{"web_search_context_size": {json_val}}}"#);
-            let cfg: StreamingConfig = serde_json::from_str(&json).unwrap();
-            assert_eq!(cfg.web_search_context_size, expected);
-        }
-
-        // Invalid values rejected at parse time
-        for bad in ["\"Low\"", "\"med\"", "\"HIGH\"", "\"none\"", "\"\""] {
-            let json = format!(r#"{{"web_search_context_size": {bad}}}"#);
-            assert!(
-                serde_json::from_str::<StreamingConfig>(&json).is_err(),
-                "expected parse error for {bad}"
-            );
-        }
     }
 
     #[test]
