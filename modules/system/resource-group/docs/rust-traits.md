@@ -1,4 +1,4 @@
-<!-- Updated: 2026-04-07 by Constructor Tech -->
+<!-- Updated: 2026-04-20 by Constructor Tech -->
 
 # Rust SDK Contracts — Resource Group
 
@@ -178,7 +178,7 @@ pub trait ResourceGroupClient: Send + Sync {
     async fn get_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<ResourceGroup, ResourceGroupError>;
     async fn list_groups(&self, ctx: &SecurityContext, query: ListQuery) -> Result<Page<ResourceGroup>, ResourceGroupError>;
     async fn update_group(&self, ctx: &SecurityContext, group_id: Uuid, request: UpdateGroupRequest) -> Result<ResourceGroup, ResourceGroupError>;
-    async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid, force: bool) -> Result<(), ResourceGroupError>;
+    async fn delete_group(&self, ctx: &SecurityContext, group_id: Uuid) -> Result<(), ResourceGroupError>;
 
     // ── Hierarchy ───────────────────────────────────────────────────
     async fn list_group_depth(&self, ctx: &SecurityContext, group_id: Uuid, query: ListQuery) -> Result<Page<ResourceGroupWithDepth>, ResourceGroupError>;
