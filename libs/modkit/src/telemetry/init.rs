@@ -7,6 +7,7 @@
 use anyhow::Context;
 #[cfg(feature = "otel")]
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
+#[cfg(feature = "otel")]
 use std::sync::Once;
 
 #[cfg(feature = "otel")]
@@ -130,6 +131,7 @@ fn build_grpc_exporter(
     b.build().context("build OTLP gRPC exporter")
 }
 
+#[cfg(feature = "otel")]
 static INIT_TRACING: Once = Once::new();
 
 /// Initialize OpenTelemetry tracing from configuration and return a layer
@@ -306,7 +308,7 @@ pub fn shutdown_metrics() {
 // ===== init_metrics_provider ==================================================
 
 #[cfg(feature = "otel")]
-static METRICS_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+static METRICS_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// Build a [`SdkMeterProvider`] from the resolved metrics exporter settings and
 /// register it as the global meter provider.
@@ -318,8 +320,9 @@ static METRICS_INIT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLo
 /// Exporter resolution: `opentelemetry.metrics.exporter` overrides
 /// `opentelemetry.exporter` when present.
 ///
-/// This function is guarded by [`OnceLock`] — the provider is built and
-/// registered at most once; subsequent calls return the cached result.
+/// Initialisation runs at most once on success and is cached. Errors are
+/// **not** cached — a transient failure (e.g. OTLP endpoint briefly
+/// unreachable) is returned to the caller, and a subsequent call may retry.
 ///
 /// # Errors
 ///
@@ -336,10 +339,16 @@ pub fn init_metrics_provider(otel_cfg: &OpenTelemetryConfig) -> anyhow::Result<(
         return Ok(());
     }
 
-    METRICS_INIT
-        .get_or_init(|| do_init_metrics_provider(otel_cfg).map_err(|e| e.to_string()))
-        .clone()
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    if METRICS_INIT.get().is_some() {
+        return Ok(());
+    }
+
+    do_init_metrics_provider(otel_cfg)?;
+    // Race between concurrent first-callers is benign: OTel allows
+    // re-registering the global meter provider, so at worst we initialise
+    // twice. The `set` returns Err for the loser of the race; ignored.
+    let _set_result = METRICS_INIT.set(());
+    Ok(())
 }
 
 #[cfg(feature = "otel")]
@@ -494,12 +503,15 @@ pub fn otel_connectivity_probe(_cfg: &super::config::OpenTelemetryConfig) -> any
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    #[cfg(feature = "otel")]
     use crate::telemetry::config::{
         Exporter, ExporterKind, OpenTelemetryConfig, OpenTelemetryResource, Sampler, TracingConfig,
     };
+    #[cfg(feature = "otel")]
     use std::collections::{BTreeMap, HashMap};
 
     /// Helper to build an `OpenTelemetryConfig` with the given tracing config.
+    #[cfg(feature = "otel")]
     fn otel_with_tracing(tracing: TracingConfig) -> OpenTelemetryConfig {
         OpenTelemetryConfig {
             tracing,
