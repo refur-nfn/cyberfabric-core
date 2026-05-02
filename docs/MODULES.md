@@ -671,7 +671,7 @@ Introduces an abstraction layer over the upstream License Manager service. The g
 
 ### Credentials Store
 #### Responsibility
-Introduces an abstraction layer over the upstream Credentials Store service. The goal is to provide a single entry point for storing, resolving, and injecting secrets without coupling feature code to a specific vault or secret-management backend.
+Introduces an abstraction layer for credentials storage, either as a local service or a connector to upstream Credentials Store service. The goal is to provide a single entry point for storing, resolving, and injecting secrets without coupling feature code to a specific vault or secret-management backend.
 #### High Level Scenarios
 - [ ] p1 - store and retrieve secrets with tenant scoping
 - [ ] p1 - adapter for single-user and single-tenant use-cases (desktop app)
@@ -679,10 +679,10 @@ Introduces an abstraction layer over the upstream Credentials Store service. The
 - [ ] p3 - audit secret access through stable adapter contracts
 - [ ] p4 - integrate with external vault backends (AWS Secrets Manager, HashiCorp Vault, etc.)
 #### More details
-- TODO: PRD link
-- TODO: Design link
-- TODO: API link
-- TODO: SDK link
+- [PRD](../modules/credstore/docs/PRD.md)
+- [Design](../modules/credstore/docs/DESIGN.md)
+- [API](../modules/credstore/credstore/README.md)
+- [SDK](../modules/credstore/credstore-sdk/README.md)
 
 ### Outbound API Interface
 #### Responsibility
@@ -753,24 +753,6 @@ Core platform service responsible for local license state, quota enforcement, fe
 - TODO: Design link
 - TODO: API link
 - TODO: SDK link
-
-### Credentials Store
-#### Responsibility
-External or enterprise credential storage system that persists and protects secrets, while HyperSpot integrates with it through the Credentials Store module.
-#### High Level Scenarios
-- [ ] p1 - store/retrieve secrets with tenant scoping
-- [ ] p1 - adapter for single-user and single-tenant use-cases (desktop app)
-- [ ] p2 - metrics collection
-- [ ] p3 - audit with retention
-- [ ] p4 - integrate with external vault backends (AWS Secrets Manager, HashiCorp Vault, etc.)
-- [ ] p5 - rotation workflows and secret health checks
-- [ ] p5 - delegated admin and approval workflows
-- [ ] p5 - enterprise compliance audit, reporting and attestations
-#### More details
-- [PRD](../modules/credstore/docs/PRD.md)
-- [Design](../modules/credstore/docs/DESIGN.md)
-- [API](../modules/credstore/credstore/README.md)
-- [SDK](../modules/credstore/credstore-sdk/README.md)
 
 ### Outbound API Gateway
 #### Responsibility
