@@ -628,7 +628,7 @@ Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 This matches exactly 4 name tokens per segment — the DB constraint and the `gts` crate are consistent.
 
-**Test artifact note**: The unit tests in `rg_gts_type_system_tests.rs` use well-known GTS instance IDs (e.g. `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1`) to register test instances in the types-registry. The `x.core._.t1.v1` segment format (with `_` as namespace placeholder) is needed only for these test-level well-known instances. **RG itself never constructs such IDs** — resource groups are anonymous instances with UUID `id` and a `type` field pointing to a type path. The `_` placeholder format is documented here for completeness in case future code needs to construct well-known instances.
+**Test artifact note**: The unit tests in `rg_gts_type_system_tests.rs` use well-known GTS instance IDs (e.g. `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~cf.core._.t1.v1`) to register test instances in the types-registry. The `cf.core._.t1.v1` segment format (with `_` as namespace placeholder) is needed only for these test-level well-known instances. **RG itself never constructs such IDs** — resource groups are anonymous instances with UUID `id` and a `type` field pointing to a type path. The `_` placeholder format is documented here for completeness in case future code needs to construct well-known instances.
 
 ---
 

@@ -45,7 +45,7 @@ fn main() {
 
     // Error 6: invalid GTS segment
     // Should trigger DE0901 - invalid GTS segment
-    let _s = "gts.vendor.core.lic.feat.v1~x.core.global.base";
+    let _s = "gts.vendor.core.lic.feat.v1~cf.core.global.base";
 
     // Error 7: Invalid GTS identifier (no trailing type segment)
     // Should trigger DE0901 - invalid GTS indentifier

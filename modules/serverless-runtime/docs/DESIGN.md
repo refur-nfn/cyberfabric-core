@@ -293,7 +293,7 @@ Each adapter plugin module registers itself during `init()`:
 impl Module for StarlarkAdapterPlugin {
     async fn init(&self, ctx: &ModuleCtx) -> anyhow::Result<()> {
         let instance_id = SlessAdapterPluginSpecV1::gts_make_instance_id(
-            "x.core.sless.runtime.starlark.v1"
+            "cf.core.sless.runtime.starlark.v1"
         );
 
         // Register instance in types-registry

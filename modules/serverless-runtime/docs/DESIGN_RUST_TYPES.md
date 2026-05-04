@@ -65,9 +65,9 @@ impl FunctionKind {
     /// Workflow is checked first because all types contain `function.v1~` in the
     /// new 2-tier hierarchy (function base → workflow derived).
     pub fn from_gts_id(function_id: &str) -> Option<Self> {
-        if function_id.contains("x.core.serverless.workflow.") {
+        if function_id.contains("cf.core.serverless.workflow.") {
             Some(FunctionKind::Workflow)
-        } else if function_id.contains("x.core.serverless.function.") {
+        } else if function_id.contains("cf.core.serverless.function.") {
             Some(FunctionKind::Function)
         } else {
             None

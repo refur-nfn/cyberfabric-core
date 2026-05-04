@@ -40,13 +40,13 @@ LL |     let _id1 = ProductV1::<()>::gts_make_instance_id("vendor.package.sku.ab
    |
    = help: Example: vendor.package.sku.abc.v1
 
-error: invalid GTS string: 'gts.vendor.core.lic.feat.v1~x.core.global.base' (DE0901)
+error: invalid GTS string: 'gts.vendor.core.lic.feat.v1~cf.core.global.base' (DE0901)
   --> $DIR/invalid_cases.rs:48:14
    |
-LL |     let _s = "gts.vendor.core.lic.feat.v1~x.core.global.base";
-   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+LL |     let _s = "gts.vendor.core.lic.feat.v1~cf.core.global.base";
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: Invalid GTS segment #2 @ offset 28: 'x.core.global.base': Too few tokens (got 4, min 5). Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
+   = note: Invalid GTS segment #2 @ offset 28: 'cf.core.global.base': Too few tokens (got 4, min 5). Expected format: vendor.package.namespace.type.vMAJOR[.MINOR]
 
 error: invalid GTS string: 'gts.vendor.core.events.type.v1' (DE0901)
   --> $DIR/invalid_cases.rs:52:14

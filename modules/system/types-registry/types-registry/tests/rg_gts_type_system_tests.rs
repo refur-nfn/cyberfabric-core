@@ -675,7 +675,7 @@ async fn test_top_level_custom_field_passes_gts_but_app_layer_rejects() {
 #[tokio::test]
 async fn test_invalid_gts_id_no_prefix() {
     let service = setup_rg_type_system();
-    let bad = json!({ "$id": "x.core.rg.type.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" });
+    let bad = json!({ "$id": "cf.core.rg.type.v1~", "$schema": "http://json-schema.org/draft-07/schema#", "type": "object" });
     assert!(service.register(vec![bad])[0].is_err());
 }
 
