@@ -484,12 +484,12 @@ upstream PRD/DESIGN definition, with no broken references.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-feature-user-groups`
 
-- **Purpose**: Orchestrate user groups entirely through delegation to the Resource Group module. Account Management registers the chained user-group type schema `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` during module initialization, triggers cascade cleanup of user groups during tenant hard-deletion, and exposes AM's user-query surface so callers can combine user existence checks with Resource Group's membership operations. Account Management deliberately does not proxy CRUD or membership calls and owns no user-group tables — all group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are performed by Resource Group.
+- **Purpose**: Orchestrate user groups entirely through delegation to the Resource Group module. Account Management registers the chained user-group type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during module initialization, triggers cascade cleanup of user groups during tenant hard-deletion, and exposes AM's user-query surface so callers can combine user existence checks with Resource Group's membership operations. Account Management deliberately does not proxy CRUD or membership calls and owns no user-group tables — all group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are performed by Resource Group.
 
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - Chained RG type-schema registration during AM module init for `gts.x.core.rg.type.v1~x.core.am.user_group.v1~`, with `allowed_memberships = [gts.cf.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
+  - Chained RG type-schema registration during AM module init for `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, with `allowed_memberships = [gts.cf.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.
@@ -519,7 +519,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Domain Model Entities**:
   - `UserGroup` (delegated view/adapter — delegated to Resource Group; not owned here)
   - `UserGroupMembership` (delegated adapter — delegated to Resource Group; not owned here)
-  - Chained type-schema reference `gts://gts.x.core.rg.type.v1~x.core.am.user_group.v1~` (registered by AM, schema body published for RG-side validation; AM stores no instance rows)
+  - Chained type-schema reference `gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (registered by AM, schema body published for RG-side validation; AM stores no instance rows)
 
 - **Design Components**:
 

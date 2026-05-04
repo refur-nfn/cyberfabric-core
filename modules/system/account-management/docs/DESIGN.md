@@ -107,7 +107,7 @@ graph LR
 | `cpt-cf-account-management-fr-idp-user-provision` | `IdpProviderPluginClient::create_user` with tenant scope binding and resolved tenant metadata (for IdP context resolution, e.g., effective Keycloak realm). |
 | `cpt-cf-account-management-fr-idp-user-deprovision` | `IdpProviderPluginClient::delete_user` with session revocation; an already-absent IdP user is treated as a successful no-op so `DELETE /tenants/{id}/users/{user_id}` remains idempotent. |
 | `cpt-cf-account-management-fr-idp-user-query` | `IdpProviderPluginClient::list_users` with tenant filter; supports optional user-ID filter for single-user lookups. |
-| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementModule` idempotently registers the user-group Resource Group type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` during module initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
+| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementModule` idempotently registers the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during module initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
 | `cpt-cf-account-management-fr-nested-user-groups` | Nested groups via Resource Group parent-child hierarchy; cycle detection enforced by Resource Group forest invariants. No AM involvement at runtime. |
@@ -362,9 +362,9 @@ Derived type schemas resolve their behavioral traits via `x-gts-traits` (per [GT
 
 | GTS Schema ID (chained, public) | Description | `x-gts-traits` |
 |---------------------------------|-------------|----------------|
-| `gts.cf.core.am.tenant_type.v1~x.core.am.provider.v1~` | Platform operator; root tenant | `allowed_parent_types: []`, `idp_provisioning: true` |
-| `gts.cf.core.am.tenant_type.v1~x.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]`, `idp_provisioning: true` |
-| `gts.cf.core.am.tenant_type.v1~x.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [x.core.am.provider.v1~, x.core.am.reseller.v1~]` |
+| `gts.cf.core.am.tenant_type.v1~cf.core.am.provider.v1~` | Platform operator; root tenant | `allowed_parent_types: []`, `idp_provisioning: true` |
+| `gts.cf.core.am.tenant_type.v1~cf.core.am.reseller.v1~` | Reseller; nestable under provider or other resellers | `allowed_parent_types: [cf.core.am.provider.v1~, cf.core.am.reseller.v1~]`, `idp_provisioning: true` |
+| `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~` | End customer; leaf tenant | `allowed_parent_types: [cf.core.am.provider.v1~, cf.core.am.reseller.v1~]` |
 
 **Runtime Registration:** New tenant types are registered via the GTS REST API (`POST /schemas`) or programmatically via `GtsStore.register_schema()`.
 
@@ -381,14 +381,14 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) if not permitted
 4. Call `IdpProviderPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `CanonicalError::Unimplemented` (HTTP 501)
 
-**User-group Resource Group type schema:** AM registers the chained RG type `gts.x.core.rg.type.v1~x.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). It lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.x.core.rg.type.v1~x.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
+**User-group Resource Group type schema:** AM registers the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). It lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
 
 **Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.cf.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json).
 
 | Trait | Value | Meaning |
 |-------|-------|---------|
 | `can_be_root` | `true` | Allows top-level user groups inside a tenant's RG subtree. |
-| `allowed_parents` | [`gts.x.core.rg.type.v1~x.core.am.user_group.v1~`] | Allows nested user groups, but only under the same user-group type. |
+| `allowed_parents` | [`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`] | Allows nested user groups, but only under the same user-group type. |
 | `allowed_memberships` | [`gts.cf.core.am.user.v1~`] | Restricts direct memberships to platform users. |
 
 Tenant-scoped placement is intentionally **not** encoded as a GTS trait on this schema. Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time, while the schema is responsible only for type topology and membership type constraints.
@@ -961,7 +961,7 @@ sequenceDiagram
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `root_tenant_type` | string (chained `GtsSchemaId`) | Yes | Full chained GTS schema identifier for the initial root tenant type. Must be registered in GTS. Deployment-specific — e.g., `gts.cf.core.am.tenant_type.v1~x.core.am.provider.v1~` for cloud hosting, `gts.cf.core.am.tenant_type.v1~x.core.am.root.v1~` for flat deployments. |
+| `root_tenant_type` | string (chained `GtsSchemaId`) | Yes | Full chained GTS schema identifier for the initial root tenant type. Must be registered in GTS. Deployment-specific — e.g., `gts.cf.core.am.tenant_type.v1~cf.core.am.provider.v1~` for cloud hosting, `gts.cf.core.am.tenant_type.v1~cf.core.am.root.v1~` for flat deployments. |
 | `root_tenant_name` | string | Yes | Human-readable name for the initial root tenant. |
 | `root_tenant_metadata` | object | No (default: `null`) | Provider-specific metadata forwarded as-is to `provision_tenant` during bootstrap. Guides the IdP provider plugin's behavior — e.g., a Keycloak provider may expect `{ "adopt_realm": "master" }` to adopt an existing realm, while omitting it or providing different metadata may trigger fresh resource creation. The choice is entirely provider-specific. AM does not interpret this value; the content contract is between the deployer and the provider plugin. When omitted, `provision_tenant` receives `null` metadata and the provider proceeds with its default behavior. |
 | _(deployment prerequisite)_ | — | — | All metadata schemas that the IdP provider may return in `ProvisionResult` entries must be pre-registered in GTS before bootstrap runs. AM validates all persisted metadata against GTS schemas; unregistered `schema_id`s are rejected with `not_found`, causing the saga finalization step to fail and the provisioning reaper to compensate. (`root_tenant_metadata` itself is opaque to AM — it is forwarded as-is to the provider plugin and is not validated against GTS schemas. The prerequisite applies only to provider-produced output that AM persists.) |
